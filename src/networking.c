@@ -12,6 +12,7 @@
  */
 
 #include "server.h"
+#include "mux.h"
 #include "atomicvar.h"
 #include "cluster.h"
 #include "script.h"
@@ -205,6 +206,7 @@ client *createClient(connection *conn) {
     listInitNode(&c->clients_pending_write_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
+    c->mux_data = NULL; /* MUX: not in multiplexed mode by default */
     if (conn) linkClient(c);
     initClientMultiState(c);
     return c;
@@ -293,7 +295,13 @@ int prepareClientToWrite(client *c) {
     if ((c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_MASTER_FORCE_REPLY)) return C_ERR;
 
-    if (!c->conn) return C_ERR; /* Fake client for AOF loading. */
+    if (!c->conn) {
+        /* MUX virtual client: no direct conn, route to mux owner */
+        if (c->flags & CLIENT_MUX_VIRTUAL) {
+            return muxPrepareVirtualClientToWrite(c);
+        }
+        return C_ERR; /* Fake client for AOF loading. */
+    }
 
     /* Schedule the client to write the output buffers to the socket, unless
      * it should already be setup to do so (it has already pending data).
@@ -1725,6 +1733,20 @@ void freeClient(client *c) {
 
     /* Release other dynamically allocated client structure fields,
      * and finally release the client structure itself. */
+    /* MUX: clean up mux-related data */
+    if (c->mux_data) {
+        if (c->flags & CLIENT_MUX_VIRTUAL) {
+            /* Virtual client: mux_data points to muxStream.
+             * The muxStream itself is freed by muxStreamFree(). */
+            c->mux_data = NULL;
+        } else {
+            /* Owner client: mux_data points to muxConnection.
+             * Free the entire mux connection and all its streams. */
+            muxConnectionFree(c->mux_data);
+            c->mux_data = NULL;
+        }
+    }
+
     if (c->name) decrRefCount(c->name);
     if (c->lib_name) decrRefCount(c->lib_name);
     if (c->lib_ver) decrRefCount(c->lib_ver);
@@ -2646,7 +2668,7 @@ int processInputBuffer(client *c) {
     /* Update client memory usage after processing the query buffer, this is
      * important in case the query buffer is big and wasn't drained during
      * the above loop (because of partially sent big commands). */
-    if (io_threads_op == IO_THREADS_OP_IDLE)
+    if (io_threads_op == IO_THREADS_OP_IDLE && c->conn)
         updateClientMemUsageAndBucket(c);
 
     return C_OK;
@@ -2756,8 +2778,15 @@ void readQueryFromClient(connection *conn) {
 
     /* There is more data in the client input buffer, continue parsing it
      * and check if there is a full command to execute. */
-    if (processInputBuffer(c) == C_ERR)
-         c = NULL;
+    if (c->mux_data && !(c->flags & CLIENT_MUX_VIRTUAL)) {
+        /* MUX mode: demux frames, dispatch to virtual clients */
+        if (muxProcessInputBuffer(c) == C_ERR)
+            c = NULL;
+    } else {
+        /* Original path: standard RESP parsing */
+        if (processInputBuffer(c) == C_ERR)
+            c = NULL;
+    }
 
 done:
     beforeNextClient(c);
@@ -2816,7 +2845,7 @@ char *getClientSockname(client *c) {
 /* Concatenate a string representing the state of a client in a human
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client) {
-    char flags[17], events[3], conninfo[CONN_INFO_LEN], *p;
+    char flags[18], events[3], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
     if (client->flags & CLIENT_SLAVE) {
@@ -2840,6 +2869,7 @@ sds catClientInfoString(sds s, client *client) {
     if (client->flags & CLIENT_READONLY) *p++ = 'r';
     if (client->flags & CLIENT_NO_EVICT) *p++ = 'e';
     if (client->flags & CLIENT_NO_TOUCH) *p++ = 'T';
+    if (client->flags & CLIENT_MUX_VIRTUAL) *p++ = 'm';
     if (p == flags) *p++ = 'N';
     *p++ = '\0';
 
@@ -2892,6 +2922,17 @@ sds catClientInfoString(sds s, client *client) {
         " resp=%i", client->resp,
         " lib-name=%s", client->lib_name ? (char*)client->lib_name->ptr : "",
         " lib-ver=%s", client->lib_ver ? (char*)client->lib_ver->ptr : ""));
+
+    /* Append MUX stream info for virtual clients */
+    if (client->flags & CLIENT_MUX_VIRTUAL && client->mux_data) {
+        muxStream *ms = (muxStream *)client->mux_data;
+        ret = sdscatfmt(ret, " mux-sid=%U", (unsigned long long)ms->stream_id);
+        ret = sdscatfmt(ret, " mux-owner=%U", (unsigned long long)(ms->mux_conn ? ms->mux_conn->owner_client->id : 0));
+    } else if (client->mux_data && !(client->flags & CLIENT_MUX_VIRTUAL)) {
+        muxConnection *mux = (muxConnection *)client->mux_data;
+        ret = sdscatfmt(ret, " mux-streams=%U", (unsigned long long)mux->active_stream_count);
+    }
+
     return ret;
 }
 
@@ -3609,6 +3650,7 @@ void helloCommand(client *c) {
     robj *username = NULL;
     robj *password = NULL;
     robj *clientname = NULL;
+    int enable_mux = 0; /* Whether the client requests MUX mode */
     for (int j = next_arg; j < c->argc; j++) {
         int moreargs = (c->argc-1) - j;
         const char *opt = c->argv[j]->ptr;
@@ -3626,6 +3668,9 @@ void helloCommand(client *c) {
                 return;
             }
             j++;
+        } else if (!strcasecmp(opt,"MULTIPLEX")) {
+            /* Client requests stream-multiplexed protocol (RSMP) */
+            enable_mux = 1;
         } else {
             addReplyErrorFormat(c,"Syntax error in HELLO option '%s'",opt);
             return;
@@ -3660,7 +3705,16 @@ void helloCommand(client *c) {
 
     /* Let's switch to the specified RESP mode. */
     if (ver) c->resp = ver;
-    addReplyMapLen(c,6 + !server.sentinel_mode);
+
+    /* Enable MUX mode if requested and not already in MUX mode */
+    if (enable_mux && !c->mux_data) {
+        muxConnection *mux = muxConnectionCreate(c);
+        c->mux_data = mux;
+        serverLog(LL_NOTICE, "Client %llu switched to MUX (stream-multiplexed) mode",
+                  (unsigned long long)c->id);
+    }
+
+    addReplyMapLen(c, 6 + !server.sentinel_mode + (c->mux_data ? 1 : 0));
 
     addReplyBulkCString(c,"server");
     addReplyBulkCString(c,"redis");
@@ -3686,6 +3740,12 @@ void helloCommand(client *c) {
 
     addReplyBulkCString(c,"modules");
     addReplyLoadedModules(c);
+
+    /* Report MUX mode status if enabled */
+    if (c->mux_data) {
+        addReplyBulkCString(c,"mux");
+        addReplyBulkCString(c,"enabled");
+    }
 }
 
 /* This callback is bound to POST and "Host:" command names. Those are not

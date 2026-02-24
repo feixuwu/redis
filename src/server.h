@@ -388,6 +388,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_MODULE_PREVENT_AOF_PROP (1ULL<<48) /* Module client do not want to propagate to AOF */
 #define CLIENT_MODULE_PREVENT_REPL_PROP (1ULL<<49) /* Module client do not want to propagate to replica */
 #define CLIENT_REPROCESSING_COMMAND (1ULL<<50) /* The client is re-processing the command. */
+#define CLIENT_MUX_VIRTUAL (1ULL<<51) /* This is a virtual client on a mux connection */
 
 /* Any flag that does not let optimize FLUSH SYNC to run it in bg as blocking client ASYNC */
 #define CLIENT_AVOID_BLOCKING_ASYNC_FLUSH (CLIENT_DENY_BLOCKING|CLIENT_MULTI|CLIENT_LUA_DEBUG|CLIENT_LUA_DEBUG_SYNC|CLIENT_MODULE)
@@ -1266,6 +1267,9 @@ typedef struct client {
     size_t ref_block_pos;        /* Access position of referenced buffer block,
                                   * i.e. the next offset to send. */
 
+    /* Multiplexed protocol (RSMP) support */
+    void *mux_data;             /* Points to muxStream (virtual client) or muxConnection (owner client), NULL if not in mux mode */
+
     /* list node in clients_pending_write list */
     listNode clients_pending_write_node;
     /* Response buffer */
@@ -1611,6 +1615,7 @@ struct redisServer {
     list *clients_to_close;     /* Clients to close asynchronously */
     list *clients_pending_write; /* There is to write or install handler. */
     list *clients_pending_read;  /* Client has pending read socket buffers. */
+    list *mux_connections_with_pending_writes; /* Mux connections that need flush. */
     list *slaves, *monitors;    /* List of slaves and MONITORs */
     client *current_client;     /* The client that triggered the command execution (External or AOF). */
     client *executing_client;   /* The client executing the current command (possibly script or module). */
@@ -2690,6 +2695,12 @@ void initThreadedIO(void);
 client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void putClientInPendingWriteQueue(client *c);
+
+/* mux.c - Redis Stream-Multiplexed Protocol */
+void muxInit(void);
+void muxFlushPendingWrites(void);
+int muxProcessInputBuffer(client *c);
+int muxPrepareVirtualClientToWrite(client *c);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);

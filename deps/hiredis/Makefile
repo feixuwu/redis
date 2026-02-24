@@ -3,7 +3,7 @@
 # Copyright (C) 2010-2011 Pieter Noordhuis <pcnoordhuis at gmail dot com>
 # This file is released under the BSD license, see the COPYING file
 
-OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o
+OBJ=alloc.o net.o hiredis.o sds.o async.o read.o sockcompat.o hiredis_mux.o
 EXAMPLES=hiredis-example hiredis-example-libevent hiredis-example-libev hiredis-example-glib hiredis-example-push hiredis-example-poll
 TESTS=hiredis-test
 LIBNAME=libhiredis
@@ -159,6 +159,7 @@ net.o: net.c fmacros.h net.h hiredis.h read.h sds.h alloc.h sockcompat.h win32.h
 read.o: read.c fmacros.h alloc.h read.h sds.h win32.h
 sds.o: sds.c sds.h sdsalloc.h alloc.h
 sockcompat.o: sockcompat.c sockcompat.h
+hiredis_mux.o: hiredis_mux.c hiredis.h read.h sds.h alloc.h async.h net.h hiredis_mux.h async_private.h
 test.o: test.c fmacros.h hiredis.h read.h sds.h alloc.h net.h sockcompat.h win32.h
 
 $(DYLIBNAME): $(OBJ)

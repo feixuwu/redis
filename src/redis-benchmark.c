@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/time.h>
 #include <signal.h>
@@ -39,6 +40,9 @@
 #include "cli_common.h"
 #include "mt19937-64.h"
 
+#include <hiredis_mux.h>
+#include <arpa/inet.h>
+
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 #define DEFAULT_LATENCY_PRECISION 3
@@ -49,6 +53,17 @@
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L          /* <= 3 secs(us precision) */
 #define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L   /* <= 3 secs(us precision) */
 #define SHOW_THROUGHPUT_INTERVAL 250  /* 250ms */
+
+#define MUX_DEFAULT_STREAMS 10  /* Default number of mux streams per connection */
+
+/* MUX frame constants for benchmark-level frame encode/decode */
+#define BENCH_MUX_HEADER_SIZE 10
+#define BENCH_MUX_MAGIC       0xAA
+#define BENCH_MUX_FRAME_DATA  0x01
+#define BENCH_MUX_TYPE_MASK   0x0F
+
+/* Forward declarations for MUX shared connection */
+typedef struct muxSharedConn muxSharedConn;
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
@@ -104,6 +119,8 @@ static struct config {
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
+    int mux_mode;         /* Enable MUX (stream-multiplexed) mode */
+    int mux_streams;      /* Number of MUX streams per connection */
 } config;
 
 typedef struct _client {
@@ -126,14 +143,62 @@ typedef struct _client {
     int thread_id;
     struct clusterNode *cluster_node;
     int slots_last_update;
+    /* MUX mode state */
+    int mux_hello_done;     /* Whether MUX HELLO handshake reply has been consumed */
+    uint32_t mux_stream_id; /* Stream ID for this client in MUX shared connection */
+    muxSharedConn *mux_conn; /* Back-pointer to shared MUX connection (NULL if not MUX) */
+    redisReader *mux_reader; /* Per-client RESP reader for MUX mode (parses demuxed data) */
 } *client;
 
 /* Threads. */
+
+/* Per-thread shared MUX connection: one TCP conn, N logical streams */
+struct muxSharedConn {
+    redisContext *ctx;          /* The single TCP connection */
+    int fd;                     /* fd for event registration */
+    int hello_done;             /* Whether HELLO MULTIPLEX handshake completed */
+    int hello_pending;          /* Whether HELLO command is pending reply */
+
+    /* Client registry: stream_id -> client mapping */
+    client *clients[1024];      /* Direct-mapped: clients[stream_id/2] (stream_id=1,3,5...) */
+    int num_clients;            /* Number of registered clients */
+    uint32_t next_stream_id;    /* Next stream ID to assign (1,3,5...) */
+
+    /* Write queue: clients that need their obuf flushed via MUX frames */
+    client **write_queue;       /* Array of clients needing write */
+    int write_queue_len;
+    int write_queue_cap;
+
+    /* MUX frame receive buffer (raw bytes from socket) */
+    char *recvbuf;
+    size_t recvbuf_len;
+    size_t recvbuf_alloc;
+
+    /* Frame parse state machine */
+    int parsing_payload;        /* 0=reading header, 1=reading payload */
+    unsigned char frame_header[BENCH_MUX_HEADER_SIZE];
+    int header_bytes_read;
+    uint8_t current_flags;
+    uint32_t current_stream_id;
+    uint32_t current_payload_len;
+    char *payload_buf;
+    size_t payload_buf_len;
+    size_t payload_buf_alloc;
+
+    /* Send buffer for batched MUX frames */
+    char *sendbuf;
+    size_t sendbuf_len;
+    size_t sendbuf_alloc;
+    size_t sendbuf_pos;         /* Bytes already sent */
+
+    int thread_id;              /* Owner thread index */
+};
 
 typedef struct benchmarkThread {
     int index;
     pthread_t thread;
     aeEventLoop *el;
+    muxSharedConn *mux_conn;    /* Shared MUX connection for this thread (NULL if not MUX mode) */
 } benchmarkThread;
 
 /* Cluster. */
@@ -169,6 +234,18 @@ static benchmarkThread *createBenchmarkThread(int index);
 static void freeBenchmarkThread(benchmarkThread *thread);
 static void freeBenchmarkThreads(void);
 static void *execBenchmarkThread(void *ptr);
+static void randomizeClientKey(client c);
+static void setClusterKeyHashTag(client c);
+static int processReply(client c, void *reply);
+
+/* MUX shared connection prototypes */
+static muxSharedConn *muxSharedConnCreate(int thread_id);
+static void muxSharedConnFree(muxSharedConn *mc);
+static void muxSharedConnRegisterClient(muxSharedConn *mc, client c);
+static void muxSharedConnQueueWrite(muxSharedConn *mc, client c);
+static void muxSharedReadHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void muxSharedWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void muxSharedConnScheduleWrite(muxSharedConn *mc);
 static clusterNode *createClusterNode(char *ip, int port);
 static redisConfig *getRedisConfig(const char *ip, int port,
                                    const char *hostsocket);
@@ -329,9 +406,415 @@ static void freeRedisConfig(redisConfig *cfg) {
     zfree(cfg);
 }
 
+/* ========================== MUX Shared Connection ========================== */
+
+/* Encode a MUX frame header into buf (must be >= BENCH_MUX_HEADER_SIZE bytes) */
+static void benchMuxEncodeHeader(unsigned char *buf, uint8_t flags,
+                                  uint32_t stream_id, uint32_t payload_len) {
+    buf[0] = BENCH_MUX_MAGIC;
+    buf[1] = flags;
+    buf[2] = (stream_id >> 24) & 0xFF;
+    buf[3] = (stream_id >> 16) & 0xFF;
+    buf[4] = (stream_id >> 8) & 0xFF;
+    buf[5] = stream_id & 0xFF;
+    buf[6] = (payload_len >> 24) & 0xFF;
+    buf[7] = (payload_len >> 16) & 0xFF;
+    buf[8] = (payload_len >> 8) & 0xFF;
+    buf[9] = payload_len & 0xFF;
+}
+
+/* Helper: grow a dynamic buffer */
+static int benchMuxBufGrow(char **buf, size_t *alloc, size_t len, size_t needed) {
+    size_t required = len + needed;
+    if (required <= *alloc) return 0;
+    size_t newalloc = *alloc ? *alloc : 4096;
+    while (newalloc < required) newalloc *= 2;
+    char *newbuf = zrealloc(*buf, newalloc);
+    if (!newbuf) return -1;
+    *buf = newbuf;
+    *alloc = newalloc;
+    return 0;
+}
+
+static muxSharedConn *muxSharedConnCreate(int thread_id) {
+    muxSharedConn *mc = zcalloc(sizeof(muxSharedConn));
+    mc->thread_id = thread_id;
+    mc->next_stream_id = 1; /* Client streams use odd IDs: 1, 3, 5, ... */
+
+    /* Establish the single TCP connection (blocking mode for handshake) */
+    const char *ip = config.conn_info.hostip;
+    int port = config.conn_info.hostport;
+    if (config.hostsocket) {
+        mc->ctx = redisConnectUnix(config.hostsocket);
+    } else {
+        mc->ctx = redisConnect(ip, port);
+    }
+    if (mc->ctx->err) {
+        fprintf(stderr, "MUX: Could not connect to Redis at %s:%d: %s\n",
+                ip, port, mc->ctx->errstr);
+        exit(1);
+    }
+
+    if (config.tls == 1) {
+        const char *err = NULL;
+        if (cliSecureConnection(mc->ctx, config.sslconfig, &err) == REDIS_ERR && err) {
+            fprintf(stderr, "Could not negotiate a TLS connection: %s\n", err);
+            exit(1);
+        }
+    }
+
+    mc->ctx->reader->maxbuf = 0;
+
+    /* Send AUTH if needed */
+    if (config.conn_info.auth) {
+        redisReply *reply;
+        if (config.conn_info.user)
+            reply = redisCommand(mc->ctx, "AUTH %s %s", config.conn_info.user, config.conn_info.auth);
+        else
+            reply = redisCommand(mc->ctx, "AUTH %s", config.conn_info.auth);
+        if (!reply || reply->type == REDIS_REPLY_ERROR) {
+            fprintf(stderr, "MUX AUTH error: %s\n", reply ? reply->str : mc->ctx->errstr);
+            exit(1);
+        }
+        freeReplyObject(reply);
+    }
+
+    if (config.conn_info.input_dbnum != 0) {
+        redisReply *reply = redisCommand(mc->ctx, "SELECT %s", config.input_dbnumstr);
+        if (!reply || reply->type == REDIS_REPLY_ERROR) {
+            fprintf(stderr, "MUX SELECT error: %s\n", reply ? reply->str : mc->ctx->errstr);
+            exit(1);
+        }
+        freeReplyObject(reply);
+    }
+
+    /* Send HELLO 3 MULTIPLEX to enable MUX mode */
+    redisReply *reply = redisCommand(mc->ctx, "HELLO 3 MULTIPLEX");
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        fprintf(stderr, "MUX HELLO error: %s\n", reply ? reply->str : mc->ctx->errstr);
+        exit(1);
+    }
+    freeReplyObject(reply);
+
+    mc->hello_done = 1;
+    mc->fd = mc->ctx->fd;
+
+    /* Switch to non-blocking mode for event-driven I/O */
+    int flags = fcntl(mc->fd, F_GETFL);
+    fcntl(mc->fd, F_SETFL, flags | O_NONBLOCK);
+    mc->ctx->flags &= ~REDIS_BLOCK;
+    mc->ctx->flags |= REDIS_CONNECTED;
+
+    /* Drain any leftover data from hiredis reader (MUX frames may have arrived
+     * piggy-backed with the HELLO reply) */
+    redisReader *reader = mc->ctx->reader;
+    size_t leftover = reader->len - reader->pos;
+    if (leftover > 0) {
+        benchMuxBufGrow(&mc->recvbuf, &mc->recvbuf_alloc, 0, leftover);
+        memcpy(mc->recvbuf, reader->buf + reader->pos, leftover);
+        mc->recvbuf_len = leftover;
+        reader->pos = reader->len;
+    }
+
+    /* Allocate write queue */
+    mc->write_queue_cap = 128;
+    mc->write_queue = zmalloc(sizeof(client) * mc->write_queue_cap);
+
+    return mc;
+}
+
+static void muxSharedConnFree(muxSharedConn *mc) {
+    if (!mc) return;
+    if (mc->ctx) redisFree(mc->ctx);
+    zfree(mc->recvbuf);
+    zfree(mc->payload_buf);
+    zfree(mc->sendbuf);
+    zfree(mc->write_queue);
+    zfree(mc);
+}
+
+/* Register a client (with its stream_id) in the shared connection's lookup table */
+static void muxSharedConnRegisterClient(muxSharedConn *mc, client c) {
+    uint32_t idx = c->mux_stream_id / 2; /* stream_id 1->0, 3->1, 5->2, etc. */
+    if (idx < 1024) {
+        mc->clients[idx] = c;
+    }
+    mc->num_clients++;
+}
+
+/* Look up a client by stream_id */
+static client muxSharedConnLookupClient(muxSharedConn *mc, uint32_t stream_id) {
+    uint32_t idx = stream_id / 2;
+    if (idx < 1024) return mc->clients[idx];
+    return NULL;
+}
+
+/* Queue a client for writing (its obuf has data to send as MUX frame) */
+static void muxSharedConnQueueWrite(muxSharedConn *mc, client c) {
+    if (mc->write_queue_len >= mc->write_queue_cap) {
+        mc->write_queue_cap *= 2;
+        mc->write_queue = zrealloc(mc->write_queue, sizeof(client) * mc->write_queue_cap);
+    }
+    mc->write_queue[mc->write_queue_len++] = c;
+}
+
+/* Process received MUX frames: parse complete frames from recvbuf,
+ * feed RESP payloads to the correct client's mux_reader, and try to
+ * extract + process replies. */
+static void muxSharedConnProcessFrames(muxSharedConn *mc) {
+    while (1) {
+        if (!mc->parsing_payload) {
+            /* Try to read frame header */
+            int needed = BENCH_MUX_HEADER_SIZE - mc->header_bytes_read;
+            size_t avail = mc->recvbuf_len;
+            if ((int)avail < needed && mc->header_bytes_read == 0 && avail < BENCH_MUX_HEADER_SIZE) break;
+            int tocopy = (int)avail < needed ? (int)avail : needed;
+            memcpy(mc->frame_header + mc->header_bytes_read, mc->recvbuf, tocopy);
+            mc->header_bytes_read += tocopy;
+            /* Consume from recvbuf */
+            mc->recvbuf_len -= tocopy;
+            if (mc->recvbuf_len > 0)
+                memmove(mc->recvbuf, mc->recvbuf + tocopy, mc->recvbuf_len);
+
+            if (mc->header_bytes_read < BENCH_MUX_HEADER_SIZE) break;
+
+            /* Decode header */
+            if (mc->frame_header[0] != BENCH_MUX_MAGIC) {
+                fprintf(stderr, "MUX: invalid frame magic 0x%02x\n", mc->frame_header[0]);
+                exit(1);
+            }
+            mc->current_flags = mc->frame_header[1];
+            mc->current_stream_id = ((uint32_t)mc->frame_header[2] << 24) |
+                                    ((uint32_t)mc->frame_header[3] << 16) |
+                                    ((uint32_t)mc->frame_header[4] << 8) |
+                                    (uint32_t)mc->frame_header[5];
+            mc->current_payload_len = ((uint32_t)mc->frame_header[6] << 24) |
+                                      ((uint32_t)mc->frame_header[7] << 16) |
+                                      ((uint32_t)mc->frame_header[8] << 8) |
+                                      (uint32_t)mc->frame_header[9];
+            mc->header_bytes_read = 0;
+
+            if (mc->current_payload_len == 0) {
+                /* Zero-length frame (PONG etc.), skip */
+                continue;
+            }
+
+            mc->parsing_payload = 1;
+            mc->payload_buf_len = 0;
+            benchMuxBufGrow(&mc->payload_buf, &mc->payload_buf_alloc, 0, mc->current_payload_len);
+        }
+
+        /* Read payload */
+        uint32_t remaining = mc->current_payload_len - (uint32_t)mc->payload_buf_len;
+        size_t avail = mc->recvbuf_len;
+        uint32_t tocopy = (uint32_t)avail < remaining ? (uint32_t)avail : remaining;
+        if (tocopy > 0) {
+            memcpy(mc->payload_buf + mc->payload_buf_len, mc->recvbuf, tocopy);
+            mc->payload_buf_len += tocopy;
+            mc->recvbuf_len -= tocopy;
+            if (mc->recvbuf_len > 0)
+                memmove(mc->recvbuf, mc->recvbuf + tocopy, mc->recvbuf_len);
+        }
+
+        if (mc->payload_buf_len < mc->current_payload_len) break;
+
+        /* Full frame received */
+        mc->parsing_payload = 0;
+        uint8_t frame_type = mc->current_flags & BENCH_MUX_TYPE_MASK;
+
+        if (frame_type == BENCH_MUX_FRAME_DATA) {
+            /* Find the client for this stream_id */
+            client c = muxSharedConnLookupClient(mc, mc->current_stream_id);
+            if (c && c->mux_reader) {
+                /* Feed RESP data to this client's reader */
+                redisReaderFeed(c->mux_reader, mc->payload_buf, mc->current_payload_len);
+
+                /* Try to extract and process replies */
+                void *reply = NULL;
+                while (c->pending) {
+                    if (redisReaderGetReply(c->mux_reader, &reply) != REDIS_OK) {
+                        fprintf(stderr, "Error: %s\n", c->mux_reader->errstr);
+                        exit(1);
+                    }
+                    if (reply != NULL) {
+                        if (c->latency < 0) c->latency = ustime() - c->start;
+                        int ret = processReply(c, reply);
+                        if (ret == 1) break; /* clientDone called */
+                    } else {
+                        break; /* Need more data */
+                    }
+                }
+            }
+        }
+        /* Other frame types silently ignored */
+    }
+}
+
+/* Read handler for the shared MUX connection fd */
+static void muxSharedReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    muxSharedConn *mc = privdata;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    /* Read raw data from socket */
+    char tmpbuf[1024 * 64];
+    ssize_t nread = read(fd, tmpbuf, sizeof(tmpbuf));
+    if (nread <= 0) {
+        if (nread == -1 && (errno == EAGAIN || errno == EINTR)) return;
+        fprintf(stderr, "MUX: read error: %s\n",
+                nread == 0 ? "connection closed" : strerror(errno));
+        exit(1);
+    }
+
+    /* Append to recvbuf */
+    benchMuxBufGrow(&mc->recvbuf, &mc->recvbuf_alloc, mc->recvbuf_len, (size_t)nread);
+    memcpy(mc->recvbuf + mc->recvbuf_len, tmpbuf, nread);
+    mc->recvbuf_len += nread;
+
+    /* Process frames */
+    muxSharedConnProcessFrames(mc);
+}
+
+/* Write handler for the shared MUX connection fd.
+ * Collects pending writes from all queued clients, wraps each in a MUX frame,
+ * and sends them in a single batch. */
+static void muxSharedWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    muxSharedConn *mc = privdata;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    /* First, flush any leftover sendbuf from previous partial write */
+    if (mc->sendbuf_len > mc->sendbuf_pos) {
+        ssize_t nwritten = write(fd, mc->sendbuf + mc->sendbuf_pos,
+                                 mc->sendbuf_len - mc->sendbuf_pos);
+        if (nwritten <= 0) {
+            if (nwritten == -1 && (errno == EAGAIN || errno == EINTR)) return;
+            fprintf(stderr, "MUX: write error: %s\n", strerror(errno));
+            exit(1);
+        }
+        mc->sendbuf_pos += nwritten;
+        if (mc->sendbuf_pos < mc->sendbuf_len) return; /* Still have data to flush */
+        mc->sendbuf_len = 0;
+        mc->sendbuf_pos = 0;
+    }
+
+    /* Build new batch from write queue */
+    if (mc->write_queue_len == 0) {
+        /* Nothing to write, unregister write event but keep read */
+        aeDeleteFileEvent(el, fd, AE_WRITABLE);
+        return;
+    }
+
+    /* Estimate total size and build MUX frames */
+    mc->sendbuf_len = 0;
+    mc->sendbuf_pos = 0;
+
+    for (int i = 0; i < mc->write_queue_len; i++) {
+        client c = mc->write_queue[i];
+        size_t cmdlen = sdslen(c->obuf) - c->written;
+        if (cmdlen <= 0) continue;
+
+        /* Initialize timing for this request batch if not yet done */
+        if (c->start == 0) {
+            /* Enforce upper bound to number of requests. */
+            int requests_issued = 0;
+            atomicGetIncr(config.requests_issued, requests_issued, config.pipeline);
+            if (requests_issued >= config.requests) {
+                continue;
+            }
+            if (config.randomkeys) randomizeClientKey(c);
+            c->start = ustime();
+            c->latency = -1;
+        }
+
+        /* Grow sendbuf for header + payload */
+        benchMuxBufGrow(&mc->sendbuf, &mc->sendbuf_alloc,
+                        mc->sendbuf_len, BENCH_MUX_HEADER_SIZE + cmdlen);
+
+        /* Write MUX frame header */
+        benchMuxEncodeHeader((unsigned char *)(mc->sendbuf + mc->sendbuf_len),
+                             BENCH_MUX_FRAME_DATA, c->mux_stream_id, (uint32_t)cmdlen);
+        mc->sendbuf_len += BENCH_MUX_HEADER_SIZE;
+
+        /* Copy RESP payload */
+        memcpy(mc->sendbuf + mc->sendbuf_len, c->obuf + c->written, cmdlen);
+        mc->sendbuf_len += cmdlen;
+
+        /* Mark client's obuf as consumed and set up for reading replies */
+        c->written = sdslen(c->obuf);
+    }
+    mc->write_queue_len = 0;
+
+    /* Send the batch */
+    if (mc->sendbuf_len > 0) {
+        ssize_t nwritten = write(fd, mc->sendbuf, mc->sendbuf_len);
+        if (nwritten <= 0) {
+            if (nwritten == -1 && (errno == EAGAIN || errno == EINTR)) {
+                /* Will retry on next write event */
+                return;
+            }
+            fprintf(stderr, "MUX: write error: %s\n", strerror(errno));
+            exit(1);
+        }
+        mc->sendbuf_pos = nwritten;
+        if ((size_t)nwritten >= mc->sendbuf_len) {
+            mc->sendbuf_len = 0;
+            mc->sendbuf_pos = 0;
+            /* All written: unregister write event */
+            aeDeleteFileEvent(el, fd, AE_WRITABLE);
+        }
+    } else {
+        aeDeleteFileEvent(el, fd, AE_WRITABLE);
+    }
+}
+
+/* Schedule a write event on the shared MUX connection */
+static void muxSharedConnScheduleWrite(muxSharedConn *mc) {
+    aeEventLoop *el;
+    if (mc->thread_id < 0) el = config.el;
+    else el = config.threads[mc->thread_id]->el;
+    aeCreateFileEvent(el, mc->fd, AE_WRITABLE, muxSharedWriteHandler, mc);
+}
+
+/* ========================== End MUX Shared Connection ========================== */
+
 static void freeClient(client c) {
     aeEventLoop *el = CLIENT_GET_EVENTLOOP(c);
     listNode *ln;
+
+    if (config.mux_mode && c->mux_conn) {
+        /* In MUX mode, the fd belongs to the shared connection.
+         * Don't delete fd events here (they belong to muxSharedConn).
+         * Don't free c->context (it's shared). */
+        if (c->thread_id >= 0) {
+            int requests_finished = 0;
+            atomicGet(config.requests_finished, requests_finished);
+            if (requests_finished >= config.requests) {
+                aeStop(el);
+            }
+        }
+        /* Unregister from shared conn */
+        uint32_t idx = c->mux_stream_id / 2;
+        if (idx < 1024 && c->mux_conn->clients[idx] == c)
+            c->mux_conn->clients[idx] = NULL;
+        c->mux_conn->num_clients--;
+        if (c->mux_reader) redisReaderFree(c->mux_reader);
+        /* c->context is NULL in MUX shared mode, don't free */
+        sdsfree(c->obuf);
+        zfree(c->randptr);
+        zfree(c->stagptr);
+        zfree(c);
+        if (config.num_threads) pthread_mutex_lock(&(config.liveclients_mutex));
+        config.liveclients--;
+        ln = listSearchKey(config.clients, c);
+        assert(ln != NULL);
+        listDelNode(config.clients, ln);
+        if (config.num_threads) pthread_mutex_unlock(&(config.liveclients_mutex));
+        return;
+    }
+
     aeDeleteFileEvent(el,c->context->fd,AE_WRITABLE);
     aeDeleteFileEvent(el,c->context->fd,AE_READABLE);
     if (c->thread_id >= 0) {
@@ -365,6 +848,27 @@ static void freeAllClients(void) {
 }
 
 static void resetClient(client c) {
+    if (config.mux_mode && c->mux_conn) {
+        /* MUX mode: don't touch fd events (they belong to muxSharedConn).
+         * Queue this client for writing via the shared connection. */
+        c->written = 0;
+        c->pending = config.pipeline;
+        /* Randomize keys and set start time for the new request batch */
+        int requests_issued = 0;
+        atomicGetIncr(config.requests_issued, requests_issued, config.pipeline);
+        if (requests_issued >= config.requests) {
+            freeClient(c);
+            return;
+        }
+        if (config.randomkeys) randomizeClientKey(c);
+        if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
+        atomicGet(config.slots_last_update, c->slots_last_update);
+        c->start = ustime();
+        c->latency = -1;
+        muxSharedConnQueueWrite(c->mux_conn, c);
+        muxSharedConnScheduleWrite(c->mux_conn);
+        return;
+    }
     aeEventLoop *el = CLIENT_GET_EVENTLOOP(c);
     aeDeleteFileEvent(el,c->context->fd,AE_WRITABLE);
     aeDeleteFileEvent(el,c->context->fd,AE_READABLE);
@@ -437,12 +941,166 @@ static void clientDone(client c) {
     }
 }
 
+/* Process a single RESP reply for both normal and MUX modes.
+ * Returns 1 if the client is done (all pending replies consumed), 0 otherwise, -1 on error. */
+static int processReply(client c, void *reply) {
+    if (reply == (void*)REDIS_REPLY_ERROR) {
+        fprintf(stderr,"Unexpected error reply, exiting...\n");
+        exit(1);
+    }
+    redisReply *r = reply;
+    if (r->type == REDIS_REPLY_ERROR) {
+        if (c->cluster_node && c->staglen) {
+            int fetch_slots = 0, do_wait = 0;
+            if (!strncmp(r->str,"MOVED",5) || !strncmp(r->str,"ASK",3))
+                fetch_slots = 1;
+            else if (!strncmp(r->str,"CLUSTERDOWN",11)) {
+                fetch_slots = 1;
+                do_wait = 1;
+                fprintf(stderr, "Error from server %s:%d: %s.\n",
+                        c->cluster_node->ip,
+                        c->cluster_node->port,
+                        r->str);
+            }
+            if (do_wait) sleep(1);
+            if (fetch_slots && !fetchClusterSlotsConfiguration(c))
+                exit(1);
+        } else {
+            if (c->cluster_node) {
+                fprintf(stderr, "Error from server %s:%d: %s\n",
+                     c->cluster_node->ip,
+                     c->cluster_node->port,
+                     r->str);
+            } else fprintf(stderr, "Error from server: %s\n", r->str);
+            exit(1);
+        }
+    }
+
+    freeReplyObject(reply);
+    /* This is an OK for prefix commands such as auth and select.*/
+    if (c->prefix_pending > 0) {
+        c->prefix_pending--;
+        c->pending--;
+        /* Discard prefix commands on first response.*/
+        if (c->prefixlen > 0) {
+            size_t j;
+            sdsrange(c->obuf, c->prefixlen, -1);
+            for (j = 0; j < c->randlen; j++)
+                c->randptr[j] -= c->prefixlen;
+            for (j = 0; j < c->staglen; j++)
+                c->stagptr[j] -= c->prefixlen;
+            c->prefixlen = 0;
+        }
+        /* Once all prefix commands are done, activate hiredis MUX layer.
+         * The hiredis MUX funcs will transparently handle frame encoding/decoding. */
+        if (c->prefix_pending == 0 && config.mux_mode) {
+            if (redisActivateMux(c->context, 1) != REDIS_OK) {
+                fprintf(stderr, "Error: Failed to activate MUX: %s\n",
+                        c->context->errstr);
+                exit(1);
+            }
+            c->mux_hello_done = 1;
+            /* sdsrange above removed the prefix from obuf, so obuf now
+             * contains only the actual commands. Copy them into the hiredis
+             * context obuf and send through MUX framing immediately. */
+            size_t cmdlen = sdslen(c->obuf);
+            if (cmdlen > 0) {
+                hisds newbuf = hi_sdscatlen(c->context->obuf, c->obuf, cmdlen);
+                if (newbuf == NULL) {
+                    fprintf(stderr, "Error: Out of memory\n");
+                    exit(1);
+                }
+                c->context->obuf = newbuf;
+                c->written = cmdlen; /* Mark all as consumed from our obuf */
+
+                /* Flush the MUX-framed data to the server */
+                int done = 0;
+                if (redisBufferWrite(c->context, &done) == REDIS_ERR) {
+                    fprintf(stderr, "Error writing MUX data: %s\n",
+                            c->context->errstr);
+                    exit(1);
+                }
+                if (!done) {
+                    /* Partial write; need to continue writing */
+                    aeEventLoop *el = CLIENT_GET_EVENTLOOP(c);
+                    aeDeleteFileEvent(el, c->context->fd, AE_READABLE);
+                    aeCreateFileEvent(el, c->context->fd, AE_WRITABLE, writeHandler, c);
+                }
+                /* If done, stay in AE_READABLE mode to receive replies */
+            }
+        }
+        return 0;
+    }
+    int requests_finished = 0;
+    atomicGetIncr(config.requests_finished, requests_finished, 1);
+    if (requests_finished < config.requests){
+        if (config.num_threads == 0) {
+            hdr_record_value(
+            config.latency_histogram,
+            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);
+            hdr_record_value(
+            config.current_sec_latency_histogram,
+            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);
+        } else {
+            hdr_record_value_atomic(
+            config.latency_histogram,
+            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);
+            hdr_record_value_atomic(
+            config.current_sec_latency_histogram,
+            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);
+        }
+    }
+    c->pending--;
+    if (c->pending == 0) {
+        clientDone(c);
+        return 1;
+    }
+    return 0;
+}
+
+/* MUX mode read handler: since hiredis MUX layer handles frame
+ * decoding transparently, this just uses standard redisBufferRead. */
+static void muxReadHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    client c = privdata;
+    void *reply = NULL;
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    if (c->latency < 0) c->latency = ustime()-(c->start);
+
+    if (redisBufferRead(c->context) != REDIS_OK) {
+        fprintf(stderr,"Error: %s\n",c->context->errstr);
+        exit(1);
+    } else {
+        while(c->pending) {
+            if (redisGetReply(c->context,&reply) != REDIS_OK) {
+                fprintf(stderr,"Error: %s\n",c->context->errstr);
+                exit(1);
+            }
+            if (reply != NULL) {
+                int ret = processReply(c, reply);
+                if (ret == 1) break; /* clientDone called */
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     void *reply = NULL;
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
+
+    /* In MUX mode, once the HELLO MULTIPLEX handshake is done and MUX funcs
+     * are active, use the muxReadHandler which relies on hiredis MUX layer. */
+    if (config.mux_mode && c->mux_hello_done) {
+        muxReadHandler(el, fd, privdata, mask);
+        return;
+    }
 
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
@@ -459,96 +1117,17 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 exit(1);
             }
             if (reply != NULL) {
-                if (reply == (void*)REDIS_REPLY_ERROR) {
-                    fprintf(stderr,"Unexpected error reply, exiting...\n");
-                    exit(1);
-                }
-                redisReply *r = reply;
-                if (r->type == REDIS_REPLY_ERROR) {
-                    /* Try to update slots configuration if reply error is
-                    * MOVED/ASK/CLUSTERDOWN and the key(s) used by the command
-                    * contain(s) the slot hash tag.
-                    * If the error is not topology-update related then we
-                    * immediately exit to avoid false results. */
-                    if (c->cluster_node && c->staglen) {
-                        int fetch_slots = 0, do_wait = 0;
-                        if (!strncmp(r->str,"MOVED",5) || !strncmp(r->str,"ASK",3))
-                            fetch_slots = 1;
-                        else if (!strncmp(r->str,"CLUSTERDOWN",11)) {
-                            /* Usually the cluster is able to recover itself after
-                            * a CLUSTERDOWN error, so try to sleep one second
-                            * before requesting the new configuration. */
-                            fetch_slots = 1;
-                            do_wait = 1;
-                            fprintf(stderr, "Error from server %s:%d: %s.\n",
-                                    c->cluster_node->ip,
-                                    c->cluster_node->port,
-                                    r->str);
-                        }
-                        if (do_wait) sleep(1);
-                        if (fetch_slots && !fetchClusterSlotsConfiguration(c))
-                            exit(1);
-                    } else {
-                        if (c->cluster_node) {
-                            fprintf(stderr, "Error from server %s:%d: %s\n",
-                                 c->cluster_node->ip,
-                                 c->cluster_node->port,
-                                 r->str);
-                        } else fprintf(stderr, "Error from server: %s\n", r->str);
-                        exit(1);
-                    }
-                }
-
-                freeReplyObject(reply);
-                /* This is an OK for prefix commands such as auth and select.*/
-                if (c->prefix_pending > 0) {
-                    c->prefix_pending--;
-                    c->pending--;
-                    /* Discard prefix commands on first response.*/
-                    if (c->prefixlen > 0) {
-                        size_t j;
-                        sdsrange(c->obuf, c->prefixlen, -1);
-                        /* We also need to fix the pointers to the strings
-                        * we need to randomize. */
-                        for (j = 0; j < c->randlen; j++)
-                            c->randptr[j] -= c->prefixlen;
-                        /* Fix the pointers to the slot hash tags */
-                        for (j = 0; j < c->staglen; j++)
-                            c->stagptr[j] -= c->prefixlen;
-                        c->prefixlen = 0;
-                    }
-                    continue;
-                }
-                int requests_finished = 0;
-                atomicGetIncr(config.requests_finished, requests_finished, 1);
-                if (requests_finished < config.requests){
-                        if (config.num_threads == 0) {
-                            hdr_record_value(
-                            config.latency_histogram,  // Histogram to record to
-                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
-                            hdr_record_value(
-                            config.current_sec_latency_histogram,  // Histogram to record to
-                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
-                        } else {
-                            hdr_record_value_atomic(
-                            config.latency_histogram,  // Histogram to record to
-                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);  // Value to record
-                            hdr_record_value_atomic(
-                            config.current_sec_latency_histogram,  // Histogram to record to
-                            (long)c->latency<=CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE ? (long)c->latency : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);  // Value to record
-                        }
-                }
-                c->pending--;
-                if (c->pending == 0) {
-                    clientDone(c);
-                    break;
-                }
+                int ret = processReply(c, reply);
+                if (ret == 1) break; /* clientDone called */
             } else {
                 break;
             }
         }
     }
 }
+
+/* In MUX mode, the hiredis MUX write function automatically wraps RESP data
+ * in MUX DATA frames, so we just send plain RESP commands in obuf. */
 
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
@@ -572,7 +1151,43 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         c->start = ustime();
         c->latency = -1;
     }
-    const ssize_t buflen = sdslen(c->obuf);
+
+    /* In MUX mode after HELLO handshake, use hiredis redisBufferWrite so that
+     * the MUX funcs->write() is called, which automatically wraps data in MUX frames.
+     * We copy the un-sent portion of our obuf into the hiredis context obuf. */
+    if (config.mux_mode && c->mux_hello_done) {
+        const ssize_t writeLen = sdslen(c->obuf) - c->written;
+        if (writeLen > 0) {
+            hisds newbuf = hi_sdscatlen(c->context->obuf,
+                                        c->obuf + c->written, writeLen);
+            if (newbuf == NULL) {
+                fprintf(stderr, "Error: Out of memory\n");
+                freeClient(c);
+                return;
+            }
+            c->context->obuf = newbuf;
+            c->written = sdslen(c->obuf); /* Mark all as consumed from our side */
+        }
+
+        int done = 0;
+        if (redisBufferWrite(c->context, &done) == REDIS_ERR) {
+            fprintf(stderr, "Error writing to the server: %s\n", c->context->errstr);
+            freeClient(c);
+            return;
+        }
+        if (done) {
+            aeDeleteFileEvent(el, c->context->fd, AE_WRITABLE);
+            aeCreateFileEvent(el, c->context->fd, AE_READABLE, readHandler, c);
+        }
+        return;
+    }
+
+    /* Determine how much to write. In MUX mode before the handshake is done,
+     * only send the prefix commands (HELLO etc.), not the actual commands.
+     * The actual commands must be sent after MUX funcs are activated. */
+    const ssize_t buflen = config.mux_mode && !c->mux_hello_done
+                           ? (ssize_t)c->prefixlen
+                           : (ssize_t)sdslen(c->obuf);
     const ssize_t writeLen = buflen-c->written;
     if (writeLen > 0) {
         void *ptr = c->obuf+c->written;
@@ -591,6 +1206,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     return;
                 }
             } else {
+                c->written += nwritten;
                 aeDeleteFileEvent(el,c->context->fd,AE_WRITABLE);
                 aeCreateFileEvent(el,c->context->fd,AE_READABLE,readHandler,c);
                 return;
@@ -625,6 +1241,118 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     int is_cluster_client = (config.cluster_mode && thread_id >= 0);
     client c = zmalloc(sizeof(struct _client));
 
+    /* Initialize MUX fields */
+    c->mux_hello_done = 0;
+    c->mux_stream_id = 0;
+    c->mux_conn = NULL;
+    c->mux_reader = NULL;
+
+    if (config.mux_mode && !is_cluster_client) {
+        /* ===== MUX shared connection mode =====
+         * Use the thread's shared TCP connection instead of creating a new one.
+         * AUTH, SELECT, HELLO are already done in muxSharedConnCreate(). */
+        benchmarkThread *thread = NULL;
+        muxSharedConn *mc = NULL;
+        if (thread_id >= 0 && config.threads) {
+            thread = config.threads[thread_id];
+            mc = thread->mux_conn;
+        }
+        /* For thread_id < 0 (single-threaded mode), we store the mux conn
+         * in a static variable that we create on first call */
+        static muxSharedConn *s_single_thread_mux = NULL;
+        if (thread_id < 0) {
+            if (!s_single_thread_mux)
+                s_single_thread_mux = muxSharedConnCreate(-1);
+            mc = s_single_thread_mux;
+        }
+
+        if (!mc) {
+            fprintf(stderr, "MUX: no shared connection for thread %d\n", thread_id);
+            exit(1);
+        }
+
+        c->context = NULL; /* No per-client connection in MUX mode */
+        c->mux_conn = mc;
+        c->mux_stream_id = mc->next_stream_id;
+        mc->next_stream_id += 2; /* Client streams: 1, 3, 5, ... */
+        c->mux_reader = redisReaderCreate();
+        c->mux_reader->maxbuf = 0;
+        c->mux_hello_done = 1; /* HELLO already done in muxSharedConnCreate */
+        c->thread_id = thread_id;
+        c->cluster_node = NULL;
+
+        /* Build the request buffer: just the commands, no prefix */
+        c->obuf = sdsempty();
+        c->prefix_pending = 0;
+        c->prefixlen = 0;
+
+        if (from) {
+            c->obuf = sdscatlen(c->obuf,
+                from->obuf + from->prefixlen,
+                sdslen(from->obuf) - from->prefixlen);
+        } else {
+            for (j = 0; j < config.pipeline; j++)
+                c->obuf = sdscatlen(c->obuf, cmd, len);
+        }
+
+        c->written = 0;
+        c->pending = config.pipeline;
+        c->start = 0;
+        c->latency = -1;
+        c->randptr = NULL;
+        c->randlen = 0;
+        c->randfree = 0;
+        c->stagptr = NULL;
+        c->staglen = 0;
+        c->stagfree = 0;
+
+        /* Set up randomization pointers */
+        if (config.randomkeys) {
+            if (from) {
+                c->randlen = from->randlen;
+                c->randfree = 0;
+                c->randptr = zmalloc(sizeof(char*) * c->randlen);
+                for (j = 0; j < (int)c->randlen; j++) {
+                    c->randptr[j] = c->obuf + (from->randptr[j] - from->obuf);
+                    c->randptr[j] += c->prefixlen - from->prefixlen;
+                }
+            } else {
+                char *p = c->obuf;
+                c->randlen = 0;
+                c->randfree = RANDPTR_INITIAL_SIZE;
+                c->randptr = zmalloc(sizeof(char*) * c->randfree);
+                while ((p = strstr(p, "__rand_int__")) != NULL) {
+                    if (c->randfree == 0) {
+                        c->randptr = zrealloc(c->randptr, sizeof(char*) * c->randlen * 2);
+                        c->randfree += c->randlen;
+                    }
+                    c->randptr[c->randlen++] = p;
+                    c->randfree--;
+                    p += 12;
+                }
+            }
+        }
+
+        /* Register with shared connection */
+        muxSharedConnRegisterClient(mc, c);
+
+        /* Register read event on the shared fd (idempotent if already registered) */
+        aeEventLoop *el = NULL;
+        if (thread_id < 0) el = config.el;
+        else el = thread->el;
+        aeCreateFileEvent(el, mc->fd, AE_READABLE, muxSharedReadHandler, mc);
+
+        /* Queue the initial write */
+        muxSharedConnQueueWrite(mc, c);
+        muxSharedConnScheduleWrite(mc);
+
+        listAddNodeTail(config.clients, c);
+        atomicIncr(config.liveclients, 1);
+        atomicGet(config.slots_last_update, c->slots_last_update);
+        return c;
+    }
+
+    /* ===== Normal (non-MUX) mode ===== */
     const char *ip = NULL;
     int port = 0;
     c->cluster_node = NULL;
@@ -706,7 +1434,14 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
         c->prefix_pending++;
     }
 
-    if (config.resp3) {
+    if (config.mux_mode) {
+        /* MUX mode: send HELLO 3 MULTIPLEX to enable MUX */
+        char *buf = NULL;
+        int len = redisFormatCommand(&buf, "HELLO 3 MULTIPLEX");
+        c->obuf = sdscatlen(c->obuf, buf, len);
+        free(buf);
+        c->prefix_pending++;
+    } else if (config.resp3) {
         char *buf = NULL;
         int len = redisFormatCommand(&buf, "HELLO 3");
         c->obuf = sdscatlen(c->obuf, buf, len);
@@ -721,6 +1456,8 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
             from->obuf+from->prefixlen,
             sdslen(from->obuf)-from->prefixlen);
     } else {
+        /* In MUX mode, plain RESP commands are sent in obuf.
+         * The hiredis MUX write layer automatically wraps them in MUX frames. */
         for (j = 0; j < config.pipeline; j++)
             c->obuf = sdscatlen(c->obuf,cmd,len);
     }
@@ -731,6 +1468,9 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
     c->randlen = 0;
     c->stagptr = NULL;
     c->staglen = 0;
+
+    /* Initialize MUX state */
+    c->mux_hello_done = 0;
 
     /* Find substrings in the output buffer that need to be randomized. */
     if (config.randomkeys) {
@@ -986,11 +1726,18 @@ static benchmarkThread *createBenchmarkThread(int index) {
     if (thread == NULL) return NULL;
     thread->index = index;
     thread->el = aeCreateEventLoop(1024*10);
+    thread->mux_conn = NULL;
     aeCreateTimeEvent(thread->el,1,showThroughput,(void *)thread,NULL);
+
+    /* In MUX mode, create the per-thread shared connection */
+    if (config.mux_mode) {
+        thread->mux_conn = muxSharedConnCreate(index);
+    }
     return thread;
 }
 
 static void freeBenchmarkThread(benchmarkThread *thread) {
+    if (thread->mux_conn) muxSharedConnFree(thread->mux_conn);
     if (thread->el) aeDeleteEventLoop(thread->el);
     zfree(thread);
 }
@@ -1490,8 +2237,15 @@ int parseOptions(int argc, char **argv) {
              } else if (config.num_threads < 0) config.num_threads = 0;
         } else if (!strcmp(argv[i],"--cluster")) {
             config.cluster_mode = 1;
-        } else if (!strcmp(argv[i],"--enable-tracking")) {
+    } else if (!strcmp(argv[i],"--enable-tracking")) {
             config.enable_tracking = 1;
+        } else if (!strcmp(argv[i],"--mux")) {
+            config.mux_mode = 1;
+        } else if (!strcmp(argv[i],"--mux-streams")) {
+            if (lastarg) goto invalid;
+            config.mux_streams = atoi(argv[++i]);
+            if (config.mux_streams <= 0) config.mux_streams = MUX_DEFAULT_STREAMS;
+            if (config.mux_streams > 1000) config.mux_streams = 1000;
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -1588,6 +2342,8 @@ usage:
 "                    mode, the key must contain \"{tag}\". Otherwise, the\n"
 "                    command will not be sent to the right cluster node.\n"
 " --enable-tracking  Send CLIENT TRACKING on before starting benchmark.\n"
+" --mux              Enable MUX (stream-multiplexed) mode.\n"
+" --mux-streams <n>  Number of MUX streams per connection (default 10).\n"
 " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
 " -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD,\n"
 "                    random members and scores for ZADD.\n"
@@ -1738,6 +2494,8 @@ int main(int argc, char **argv) {
     config.slots_last_update = 0;
     config.enable_tracking = 0;
     config.resp3 = 0;
+    config.mux_mode = 0;
+    config.mux_streams = MUX_DEFAULT_STREAMS;
 
     i = parseOptions(argc,argv);
     argc -= i;

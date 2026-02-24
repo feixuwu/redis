@@ -7,6 +7,7 @@
  */
 
 #include "server.h"
+#include "mux.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "slowlog.h"
@@ -930,7 +931,9 @@ void removeClientFromMemUsageBucket(client *c, int allow_eviction) {
  * returns 1 if client eviction for this client is allowed, 0 otherwise.
  */
 int updateClientMemUsageAndBucket(client *c) {
-    serverAssert(io_threads_op == IO_THREADS_OP_IDLE && c->conn);
+    serverAssert(io_threads_op == IO_THREADS_OP_IDLE);
+    /* Skip virtual MUX clients that have no physical connection */
+    if (!c->conn) return 0;
     int allow_eviction = clientEvictionAllowed(c);
     removeClientFromMemUsageBucket(c, allow_eviction);
 
@@ -1026,6 +1029,11 @@ void clientsCron(void) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
+
+        /* Skip MUX virtual clients - they have no physical connection
+         * and are managed by their owner (mux) client. */
+        if (c->flags & CLIENT_MUX_VIRTUAL) continue;
+
         /* The following functions do different service checks on the client.
          * The protocol is that they return non-zero if the client was
          * terminated. */
@@ -1754,6 +1762,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* Handle writes with pending output buffers. */
+    muxFlushPendingWrites(); /* Flush MUX framed replies before regular writes */
     handleClientsWithPendingWritesUsingThreads();
 
     /* Record cron time in beforeSleep. This does not include the time consumed by AOF writing and IO writing above. */
@@ -2620,6 +2629,7 @@ void initServer(void) {
     server.monitors = listCreate();
     server.clients_pending_write = listCreate();
     server.clients_pending_read = listCreate();
+    muxInit(); /* Initialize MUX multiplexed protocol support */
     server.clients_timeout_table = raxNew();
     server.replication_allowed = 1;
     server.slaveseldb = -1; /* Force to emit the first SELECT command. */
