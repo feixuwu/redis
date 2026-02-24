@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+*.o
+*.d
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+__pycache__/
+*.pyc

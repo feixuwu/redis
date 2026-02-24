@@ -1,0 +1,38 @@
+# Redis MUX Proxy Configuration
+
+# Number of worker threads (0 = auto-detect CPU cores)
+workers: 1
+
+# Proxy authentication password (empty = no auth required)
+proxy_password: ""
+
+# Admin management port
+admin_port: 9090
+
+# MUX settings
+mux:
+  enabled: true
+  max_streams_per_connection: 1024
+
+# Backend Redis instances mapping
+# Each entry maps a local listen port to a backend Redis address
+backends:
+  - listen_port: 6479
+    backend_addr: "127.0.0.1"
+    backend_port: 6389
+    backend_password: ""
+
+# Logging configuration
+log:
+  level: "INFO"          # DEBUG, INFO, WARN, ERROR
+  file: "proxy.log"      # Log file path (empty = stdout)
+  max_size_mb: 100       # Max log file size before rotation
+  max_files: 5           # Number of rotated log files to keep
+
+# Graceful shutdown timeout in seconds
+shutdown_timeout: 30
+
+# Hot upgrade settings
+hot_upgrade:
+  socket_path: "/tmp/redis-mux-proxy.sock"
+  timeout: 30
