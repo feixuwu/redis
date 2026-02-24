@@ -14,7 +14,7 @@ class WorkerThread;
 
 // MUX frame header constants (matching hiredis_mux.h / mux.h)
 constexpr uint8_t  MUX_FRAME_MAGIC          = 0xAA;
-constexpr size_t   MUX_FRAME_HEADER_SIZE    = 10;
+constexpr size_t   MUX_FRAME_HEADER_SIZE    = 14;
 constexpr uint8_t  MUX_FRAME_DATA           = 0x01;
 constexpr uint8_t  MUX_FRAME_STREAM_OPEN    = 0x02;
 constexpr uint8_t  MUX_FRAME_STREAM_CLOSE   = 0x03;
@@ -50,13 +50,13 @@ public:
     void close();
 
     // Stream management
-    uint32_t createStream(ClientConnection* client);
-    void closeStream(uint32_t stream_id);
-    ClientConnection* getStreamClient(uint32_t stream_id) const;
+    uint64_t createStream(ClientConnection* client);
+    void closeStream(uint64_t stream_id);
+    ClientConnection* getStreamClient(uint64_t stream_id) const;
 
     // Data sending
-    void sendData(uint32_t stream_id, const char* data, size_t len);
-    void sendFrame(uint8_t type, uint32_t stream_id, const char* payload, size_t payload_len);
+    void sendData(uint64_t stream_id, const char* data, size_t len);
+    void sendFrame(uint8_t type, uint64_t stream_id, const char* payload, size_t payload_len);
 
     // I/O handlers
     void onReadable();
@@ -85,12 +85,12 @@ private:
     MuxConnState state_ = MuxConnState::CONNECTING;
 
     // Stream ID allocator (odd IDs for client-initiated)
-    uint32_t next_stream_id_ = 1;
+    uint64_t next_stream_id_ = 1;
     uint32_t active_stream_count_ = 0;
     uint32_t max_streams_;
 
     // Stream mapping: stream_id -> ClientConnection*
-    std::unordered_map<uint32_t, ClientConnection*> streams_;
+    std::unordered_map<uint64_t, ClientConnection*> streams_;
 
     // Pending clients waiting for connection to become READY
     std::vector<ClientConnection*> pending_clients_;
@@ -100,7 +100,7 @@ private:
     size_t header_bytes_read_ = 0;
     bool parsing_payload_ = false;
     uint8_t current_flags_ = 0;
-    uint32_t current_stream_id_ = 0;
+    uint64_t current_stream_id_ = 0;
     uint32_t current_payload_len_ = 0;
     std::vector<char> frame_payload_buf_;
 
@@ -113,13 +113,13 @@ private:
 
     // Frame encode/decode
     static void encodeFrameHeader(unsigned char* buf, uint8_t flags,
-                                   uint32_t stream_id, uint32_t payload_len);
+                                   uint64_t stream_id, uint32_t payload_len);
     bool decodeFrameHeader(const unsigned char* buf, uint8_t& flags,
-                           uint32_t& stream_id, uint32_t& payload_len);
+                           uint64_t& stream_id, uint32_t& payload_len);
 
     // Process received frames
     void processRecvBuffer();
-    void handleFrame(uint8_t type, uint32_t stream_id, const char* payload, size_t len);
+    void handleFrame(uint8_t type, uint64_t stream_id, const char* payload, size_t len);
 
     // Handshake and connection lifecycle
     void startHandshake();

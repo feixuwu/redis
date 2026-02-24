@@ -45,7 +45,7 @@ const std::string& ClientConnection::getProxyPassword() const {
     return g_proxy_password ? *g_proxy_password : empty;
 }
 
-void ClientConnection::setStreaming(MuxBackendConnection* conn, uint32_t stream_id) {
+void ClientConnection::setStreaming(MuxBackendConnection* conn, uint64_t stream_id) {
     backend_conn_ = conn;
     stream_id_ = stream_id;
     state_ = ClientState::STREAMING;
@@ -68,6 +68,7 @@ void ClientConnection::close() {
 
 void ClientConnection::onReadable() {
     if (state_ == ClientState::CLOSING) return;
+    if (paused_) return;  // Hot upgrade drain mode: don't read new data
 
     // Read data from client
     char buf[8192];
@@ -223,7 +224,7 @@ bool ClientConnection::ensureBackendStream() {
     }
 
     // Create a new stream on the backend connection
-    uint32_t sid = mux_conn->createStream(this);
+    uint64_t sid = mux_conn->createStream(this);
     if (sid == 0) {
         LOG_ERROR("Client fd=%d: failed to create stream on backend %s:%d", fd_, addr.c_str(), port);
         sendError("ERR backend stream creation failed");
@@ -232,7 +233,7 @@ bool ClientConnection::ensureBackendStream() {
     }
 
     setStreaming(mux_conn, sid);
-    LOG_DEBUG("Client fd=%d bound to backend %s:%d stream=%u", fd_, addr.c_str(), port, sid);
+    LOG_DEBUG("Client fd=%d bound to backend %s:%d stream=%llu", fd_, addr.c_str(), port, (unsigned long long)sid);
     return true;
 }
 

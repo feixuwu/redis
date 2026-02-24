@@ -15,15 +15,15 @@
 #include "server.h"
 
 /* ========================== Frame Format ==========================
- * +--------+--------+--------+--------+--------+--------+-----------+
+ * +--------+--------+------------------+--------+--------+-----------+
  * | Magic  | Flags  |     Stream ID    |    Payload Len  | Payload   |
- * | 1 byte | 1 byte |     4 bytes      |    4 bytes      | N bytes   |
- * +--------+--------+--------+--------+--------+--------+-----------+
- *  Total Header: 10 bytes
+ * | 1 byte | 1 byte |     8 bytes      |    4 bytes      | N bytes   |
+ * +--------+--------+------------------+--------+--------+-----------+
+ *  Total Header: 14 bytes
  */
 
 /* Frame header size */
-#define MUX_FRAME_HEADER_SIZE 10
+#define MUX_FRAME_HEADER_SIZE 14
 
 /* Magic byte for frame synchronization */
 #define MUX_FRAME_MAGIC 0xAA
@@ -72,7 +72,7 @@ typedef struct muxStream muxStream;
 
 /* Per-stream state, maps to a virtual client */
 struct muxStream {
-    uint32_t stream_id;             /* Logical stream identifier */
+    uint64_t stream_id;             /* Logical stream identifier */
     client *virtual_client;         /* Virtual client for this stream */
     muxConnection *mux_conn;        /* Back-pointer to parent mux connection */
     muxStreamState state;           /* Current stream state */
@@ -85,8 +85,8 @@ struct muxConnection {
     connection *conn;               /* Underlying TCP connection */
     client *owner_client;           /* The physical connection's "owner" client */
     dict *streams;                  /* Stream ID -> muxStream mapping */
-    uint32_t next_server_stream_id; /* Next even stream ID for server push */
-    uint32_t max_client_stream_id;  /* Highest client stream ID seen */
+    uint64_t next_server_stream_id; /* Next even stream ID for server push */
+    uint64_t max_client_stream_id;  /* Highest client stream ID seen */
     uint32_t max_concurrent_streams;/* Configurable limit */
     uint32_t active_stream_count;   /* Current number of active streams */
 
@@ -97,7 +97,7 @@ struct muxConnection {
     sds frame_buf;                  /* Frame payload reassembly buffer */
     int parsing_payload;            /* 1 if currently reading payload, 0 if reading header */
     uint8_t current_flags;          /* Current frame's flags */
-    uint32_t current_stream_id;     /* Current frame's stream ID */
+    uint64_t current_stream_id;     /* Current frame's stream ID */
 
     /* Batch write buffer for response framing */
     sds write_batch_buf;            /* Accumulated framed responses for batch write */
@@ -121,9 +121,9 @@ muxConnection *muxConnectionCreate(client *owner);
 void muxConnectionFree(muxConnection *mux);
 
 /* Stream management */
-muxStream *muxStreamCreate(muxConnection *mux, uint32_t stream_id);
+muxStream *muxStreamCreate(muxConnection *mux, uint64_t stream_id);
 void muxStreamFree(muxStream *ms);
-muxStream *muxStreamLookup(muxConnection *mux, uint32_t stream_id);
+muxStream *muxStreamLookup(muxConnection *mux, uint64_t stream_id);
 
 /* Frame processing (read path) */
 int muxProcessInputBuffer(client *c);
@@ -133,13 +133,13 @@ void muxFrameReply(muxConnection *mux, muxStream *ms, client *vc);
 void muxFlushPendingWrites(void);
 
 /* Frame encoding/decoding helpers */
-void muxEncodeFrameHeader(unsigned char *buf, uint8_t flags, uint32_t stream_id, uint32_t payload_len);
-int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint32_t *stream_id, uint32_t *payload_len);
+void muxEncodeFrameHeader(unsigned char *buf, uint8_t flags, uint64_t stream_id, uint32_t payload_len);
+int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint64_t *stream_id, uint32_t *payload_len);
 
 /* Control frames */
 void muxSendPong(muxConnection *mux);
-void muxSendGoaway(muxConnection *mux, uint32_t last_stream_id, uint32_t error_code);
-void muxSendStreamError(muxConnection *mux, uint32_t stream_id, const char *errmsg);
+void muxSendGoaway(muxConnection *mux, uint64_t last_stream_id, uint32_t error_code);
+void muxSendStreamError(muxConnection *mux, uint64_t stream_id, const char *errmsg);
 
 /* Put a mux connection into the pending write queue */
 void muxPutInPendingWriteQueue(muxConnection *mux);

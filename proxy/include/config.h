@@ -46,6 +46,10 @@ public:
     // Override config values from command line arguments
     void applyCommandLine(int argc, char* argv[]);
 
+    // Config file path
+    void setConfigPath(const std::string& path) { config_path_ = path; }
+    const std::string& getConfigPath() const { return config_path_; }
+
     // Accessors
     int getWorkers() const { return workers_; }
     const std::string& getProxyPassword() const { return proxy_password_; }
@@ -62,6 +66,7 @@ public:
 
 private:
     int workers_ = 0;
+    std::string config_path_;
     std::string proxy_password_;
     uint16_t admin_port_ = 9090;
     MuxConfig mux_config_;

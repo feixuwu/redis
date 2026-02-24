@@ -16,17 +16,17 @@
 
 /* ========================== Dict Type for Streams ========================== */
 
-/* Dict type for stream_id (uint32_t) -> muxStream* mapping.
+/* Dict type for stream_id (uint64_t) -> muxStream* mapping.
  * We store stream_id as the key using a simple cast to void*. */
 static uint64_t muxStreamDictHashFunction(const void *key) {
-    uint32_t k = (uint32_t)(uintptr_t)key;
-    return dictGenHashFunction(&k, sizeof(uint32_t));
+    uint64_t k = (uint64_t)(uintptr_t)key;
+    return dictGenHashFunction(&k, sizeof(uint64_t));
 }
 
 static int muxStreamDictKeyCompare(dict *d, const void *key1, const void *key2) {
     UNUSED(d);
-    uint32_t k1 = (uint32_t)(uintptr_t)key1;
-    uint32_t k2 = (uint32_t)(uintptr_t)key2;
+    uint64_t k1 = (uint64_t)(uintptr_t)key1;
+    uint64_t k2 = (uint64_t)(uintptr_t)key2;
     /* Redis dict convention: return 0 for NOT equal, non-zero for equal. */
     return k1 == k2;
 }
@@ -43,34 +43,42 @@ static dictType muxStreamDictType = {
 /* ========================== Frame Encoding/Decoding ========================== */
 
 /* Encode a frame header into buf (must be at least MUX_FRAME_HEADER_SIZE bytes) */
-void muxEncodeFrameHeader(unsigned char *buf, uint8_t flags, uint32_t stream_id, uint32_t payload_len) {
+void muxEncodeFrameHeader(unsigned char *buf, uint8_t flags, uint64_t stream_id, uint32_t payload_len) {
     buf[0] = MUX_FRAME_MAGIC;
     buf[1] = flags;
-    /* Stream ID in big-endian */
-    buf[2] = (stream_id >> 24) & 0xFF;
-    buf[3] = (stream_id >> 16) & 0xFF;
-    buf[4] = (stream_id >> 8) & 0xFF;
-    buf[5] = stream_id & 0xFF;
+    /* Stream ID in big-endian (8 bytes) */
+    buf[2] = (stream_id >> 56) & 0xFF;
+    buf[3] = (stream_id >> 48) & 0xFF;
+    buf[4] = (stream_id >> 40) & 0xFF;
+    buf[5] = (stream_id >> 32) & 0xFF;
+    buf[6] = (stream_id >> 24) & 0xFF;
+    buf[7] = (stream_id >> 16) & 0xFF;
+    buf[8] = (stream_id >> 8) & 0xFF;
+    buf[9] = stream_id & 0xFF;
     /* Payload length in big-endian */
-    buf[6] = (payload_len >> 24) & 0xFF;
-    buf[7] = (payload_len >> 16) & 0xFF;
-    buf[8] = (payload_len >> 8) & 0xFF;
-    buf[9] = payload_len & 0xFF;
+    buf[10] = (payload_len >> 24) & 0xFF;
+    buf[11] = (payload_len >> 16) & 0xFF;
+    buf[12] = (payload_len >> 8) & 0xFF;
+    buf[13] = payload_len & 0xFF;
 }
 
 /* Decode a frame header from buf. Returns C_OK on success, C_ERR if magic mismatch. */
-int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint32_t *stream_id, uint32_t *payload_len) {
+int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint64_t *stream_id, uint32_t *payload_len) {
     if (buf[0] != MUX_FRAME_MAGIC) return C_ERR;
 
     *flags = buf[1];
-    *stream_id = ((uint32_t)buf[2] << 24) |
-                 ((uint32_t)buf[3] << 16) |
-                 ((uint32_t)buf[4] << 8)  |
-                 ((uint32_t)buf[5]);
-    *payload_len = ((uint32_t)buf[6] << 24) |
-                   ((uint32_t)buf[7] << 16) |
-                   ((uint32_t)buf[8] << 8)  |
-                   ((uint32_t)buf[9]);
+    *stream_id = ((uint64_t)buf[2] << 56) |
+                 ((uint64_t)buf[3] << 48) |
+                 ((uint64_t)buf[4] << 40) |
+                 ((uint64_t)buf[5] << 32) |
+                 ((uint64_t)buf[6] << 24) |
+                 ((uint64_t)buf[7] << 16) |
+                 ((uint64_t)buf[8] << 8)  |
+                 ((uint64_t)buf[9]);
+    *payload_len = ((uint32_t)buf[10] << 24) |
+                   ((uint32_t)buf[11] << 16) |
+                   ((uint32_t)buf[12] << 8)  |
+                   ((uint32_t)buf[13]);
     return C_OK;
 }
 
@@ -188,7 +196,7 @@ static client *muxCreateVirtualClient(muxStream *ms) {
     return vc;
 }
 
-muxStream *muxStreamCreate(muxConnection *mux, uint32_t stream_id) {
+muxStream *muxStreamCreate(muxConnection *mux, uint64_t stream_id) {
     /* Check concurrent stream limit */
     if (mux->active_stream_count >= mux->max_concurrent_streams) {
         serverLog(LL_WARNING, "MUX: max concurrent streams reached (%u) for client %llu",
@@ -201,9 +209,9 @@ muxStream *muxStreamCreate(muxConnection *mux, uint32_t stream_id) {
      * exists in the dict, or is <= max_client_stream_id and is odd, it
      * means the ID was reused (possibly after uint32 wraparound). */
     if (stream_id % 2 == 1 && stream_id <= mux->max_client_stream_id) {
-        serverLog(LL_WARNING, "MUX: stream ID %u is not greater than max seen %u "
+        serverLog(LL_WARNING, "MUX: stream ID %llu is not greater than max seen %llu "
                   "(possible ID reuse/wraparound) for client %llu",
-                  stream_id, mux->max_client_stream_id,
+                  (unsigned long long)stream_id, (unsigned long long)mux->max_client_stream_id,
                   (unsigned long long)mux->owner_client->id);
         return NULL;
     }
@@ -246,7 +254,7 @@ void muxStreamFree(muxStream *ms) {
     zfree(ms);
 }
 
-muxStream *muxStreamLookup(muxConnection *mux, uint32_t stream_id) {
+muxStream *muxStreamLookup(muxConnection *mux, uint64_t stream_id) {
     dictEntry *de = dictFind(mux->streams, (void *)(uintptr_t)stream_id);
     return de ? dictGetVal(de) : NULL;
 }
@@ -254,7 +262,7 @@ muxStream *muxStreamLookup(muxConnection *mux, uint32_t stream_id) {
 /* ========================== Read Path: Frame Processing ========================== */
 
 /* Process a single complete frame that has been fully received. */
-static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint32_t stream_id,
+static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint64_t stream_id,
                            const char *payload, uint32_t payload_len)
 {
     uint8_t frame_type = flags & MUX_FRAME_TYPE_MASK;
@@ -353,7 +361,8 @@ static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint32_t stream_id
         uint32_t offset = 0;
         while (offset + MUX_FRAME_HEADER_SIZE <= payload_len) {
             uint8_t sub_flags;
-            uint32_t sub_stream_id, sub_payload_len;
+            uint64_t sub_stream_id;
+            uint32_t sub_payload_len;
 
             if (muxDecodeFrameHeader((const unsigned char *)payload + offset,
                                      &sub_flags, &sub_stream_id, &sub_payload_len) == C_ERR) {
@@ -655,27 +664,31 @@ void muxSendPong(muxConnection *mux) {
     muxPutInPendingWriteQueue(mux);
 }
 
-void muxSendGoaway(muxConnection *mux, uint32_t last_stream_id, uint32_t error_code) {
+void muxSendGoaway(muxConnection *mux, uint64_t last_stream_id, uint32_t error_code) {
     unsigned char header[MUX_FRAME_HEADER_SIZE];
-    unsigned char payload[8];
+    unsigned char payload[12];
 
-    /* Payload: last_stream_id (4 bytes) + error_code (4 bytes) */
-    payload[0] = (last_stream_id >> 24) & 0xFF;
-    payload[1] = (last_stream_id >> 16) & 0xFF;
-    payload[2] = (last_stream_id >> 8) & 0xFF;
-    payload[3] = last_stream_id & 0xFF;
-    payload[4] = (error_code >> 24) & 0xFF;
-    payload[5] = (error_code >> 16) & 0xFF;
-    payload[6] = (error_code >> 8) & 0xFF;
-    payload[7] = error_code & 0xFF;
+    /* Payload: last_stream_id (8 bytes) + error_code (4 bytes) */
+    payload[0] = (last_stream_id >> 56) & 0xFF;
+    payload[1] = (last_stream_id >> 48) & 0xFF;
+    payload[2] = (last_stream_id >> 40) & 0xFF;
+    payload[3] = (last_stream_id >> 32) & 0xFF;
+    payload[4] = (last_stream_id >> 24) & 0xFF;
+    payload[5] = (last_stream_id >> 16) & 0xFF;
+    payload[6] = (last_stream_id >> 8) & 0xFF;
+    payload[7] = last_stream_id & 0xFF;
+    payload[8] = (error_code >> 24) & 0xFF;
+    payload[9] = (error_code >> 16) & 0xFF;
+    payload[10] = (error_code >> 8) & 0xFF;
+    payload[11] = error_code & 0xFF;
 
-    muxEncodeFrameHeader(header, MUX_FRAME_GOAWAY, MUX_STREAM_ID_CONTROL, 8);
+    muxEncodeFrameHeader(header, MUX_FRAME_GOAWAY, MUX_STREAM_ID_CONTROL, 12);
     mux->write_batch_buf = sdscatlen(mux->write_batch_buf, header, MUX_FRAME_HEADER_SIZE);
-    mux->write_batch_buf = sdscatlen(mux->write_batch_buf, payload, 8);
+    mux->write_batch_buf = sdscatlen(mux->write_batch_buf, payload, 12);
     muxPutInPendingWriteQueue(mux);
 }
 
-void muxSendStreamError(muxConnection *mux, uint32_t stream_id, const char *errmsg) {
+void muxSendStreamError(muxConnection *mux, uint64_t stream_id, const char *errmsg) {
     unsigned char header[MUX_FRAME_HEADER_SIZE];
     size_t msglen = strlen(errmsg);
 

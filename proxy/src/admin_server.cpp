@@ -34,6 +34,7 @@ bool AdminServer::init(uint16_t port, EventLoop& loop) {
 
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -201,6 +202,8 @@ void AdminServer::processCommand(AdminClient* client, const std::string& cmd,
             handleProxyConnections(client);
         } else if (subcmd == "UPGRADE") {
             handleProxyUpgrade(client, sub_args);
+        } else if (subcmd == "WORKER") {
+            handleProxyWorker(client, sub_args);
         } else if (subcmd == "LOG") {
             handleProxyLogLevel(client, sub_args);
         } else {
@@ -397,15 +400,80 @@ void AdminServer::handleProxyConnections(AdminClient* client) {
 void AdminServer::handleProxyUpgrade(AdminClient* client, const std::vector<std::string>& args) {
     if (args.empty()) {
         // PROXY UPGRADE - trigger upgrade
-        sendResponse(client, respError("ERR hot upgrade not yet implemented"));
+        auto& mgr = server_->getHotUpgradeManager();
+        if (mgr.getState() != UpgradeState::IDLE) {
+            sendResponse(client, respError("ERR hot upgrade already in progress: " + mgr.getStateString()));
+            return;
+        }
+        // Trigger upgrade asynchronously via the main loop
+        server_->triggerHotUpgrade();
+        sendResponse(client, respSimpleString("OK upgrade initiated"));
     } else {
         std::string subcmd = args[0];
         std::transform(subcmd.begin(), subcmd.end(), subcmd.begin(), ::toupper);
         if (subcmd == "STATUS") {
-            sendResponse(client, respBulkString("idle"));
+            auto& mgr = server_->getHotUpgradeManager();
+            sendResponse(client, respBulkString(mgr.getStateString()));
         } else {
             sendResponse(client, respError("ERR usage: PROXY UPGRADE [STATUS]"));
         }
+    }
+}
+
+void AdminServer::handleProxyWorker(AdminClient* client, const std::vector<std::string>& args) {
+    if (args.empty()) {
+        // PROXY WORKER - show current worker count
+        sendResponse(client, respInteger(server_->getWorkerCount()));
+        return;
+    }
+
+    std::string action = args[0];
+    std::transform(action.begin(), action.end(), action.begin(), ::toupper);
+
+    if (action == "ADD") {
+        // PROXY WORKER ADD [count]
+        int count = 1;
+        if (args.size() > 1) {
+            try {
+                count = std::stoi(args[1]);
+            } catch (...) {
+                sendResponse(client, respError("ERR invalid count"));
+                return;
+            }
+        }
+        if (count <= 0 || count > 64) {
+            sendResponse(client, respError("ERR count must be between 1 and 64"));
+            return;
+        }
+        if (server_->addWorkers(count)) {
+            sendResponse(client, respSimpleString("OK added " + std::to_string(count) +
+                         " worker(s), total: " + std::to_string(server_->getWorkerCount())));
+        } else {
+            sendResponse(client, respError("ERR failed to add workers"));
+        }
+    } else if (action == "REMOVE") {
+        // PROXY WORKER REMOVE [count]
+        int count = 1;
+        if (args.size() > 1) {
+            try {
+                count = std::stoi(args[1]);
+            } catch (...) {
+                sendResponse(client, respError("ERR invalid count"));
+                return;
+            }
+        }
+        if (count <= 0) {
+            sendResponse(client, respError("ERR count must be positive"));
+            return;
+        }
+        if (server_->removeWorkers(count)) {
+            sendResponse(client, respSimpleString("OK removed " + std::to_string(count) +
+                         " worker(s), total: " + std::to_string(server_->getWorkerCount())));
+        } else {
+            sendResponse(client, respError("ERR failed to remove workers (must keep at least 1)"));
+        }
+    } else {
+        sendResponse(client, respError("ERR usage: PROXY WORKER [ADD|REMOVE] [count]"));
     }
 }
 

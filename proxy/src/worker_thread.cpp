@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <signal.h>
+#include <chrono>
 
 namespace proxy {
 
@@ -191,6 +192,14 @@ void WorkerThread::processPendingTasks() {
             case PendingTask::CLOSE_BACKEND:
                 closeBackendConnections(task.listen_port);
                 break;
+            case PendingTask::PAUSE_READS:
+                pauseClientReads();
+                pause_done_.store(true);
+                break;
+            case PendingTask::DETACH_ALL:
+                detachAllClients();
+                detach_done_.store(true);
+                break;
         }
     }
 }
@@ -216,6 +225,103 @@ void WorkerThread::handleNewClient(int client_fd, uint16_t listen_port) {
         });
 
     LOG_DEBUG("Worker %d: new client fd=%d for listen_port=%d", id_, client_fd, listen_port);
+}
+
+std::vector<WorkerThread::ClientConnInfo> WorkerThread::getClientConnInfos() const {
+    std::vector<ClientConnInfo> infos;
+    for (const auto& [fd, conn] : connections_) {
+        ClientConnInfo info;
+        info.fd = fd;
+        info.listen_port = conn->getListenPort();
+        info.authenticated = conn->isAuthenticated();
+        info.stream_id = conn->getStreamId();
+        infos.push_back(info);
+    }
+    return infos;
+}
+
+void WorkerThread::dispatchPauseReads() {
+    pause_done_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_tasks_.push_back(PendingTask{PendingTask::PAUSE_READS, -1, 0});
+    }
+    uint64_t val = 1;
+    (void)::write(notify_fd_, &val, sizeof(val));
+}
+
+bool WorkerThread::waitPauseDone(int timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!pause_done_.load() && std::chrono::steady_clock::now() < deadline) {
+        usleep(1000); // 1ms
+    }
+    return pause_done_.load();
+}
+
+void WorkerThread::dispatchDetachAll() {
+    detach_done_.store(false);
+    detached_infos_.clear();
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_tasks_.push_back(PendingTask{PendingTask::DETACH_ALL, -1, 0});
+    }
+    uint64_t val = 1;
+    (void)::write(notify_fd_, &val, sizeof(val));
+}
+
+bool WorkerThread::waitDetachDone(int timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!detach_done_.load() && std::chrono::steady_clock::now() < deadline) {
+        usleep(1000); // 1ms
+    }
+    return detach_done_.load();
+}
+
+std::vector<WorkerThread::ClientConnInfo> WorkerThread::getDetachedInfos() {
+    return std::move(detached_infos_);
+}
+
+void WorkerThread::pauseClientReads() {
+    // Stop reading from client fds to prevent new requests.
+    // Two-pronged approach:
+    // 1. Set paused flag on each ClientConnection (prevents reading even if
+    //    this epoll batch already has READABLE events for the fd)
+    // 2. Modify epoll to WRITABLE-only (prevents future epoll_wait from
+    //    returning READABLE for these fds)
+    for (auto& [fd, conn] : connections_) {
+        conn->setPaused(true);
+        event_loop_.modifyEvent(fd, EVENT_WRITABLE);
+    }
+    LOG_INFO("Worker %d: paused reads on %zu client connections", id_, connections_.size());
+}
+
+void WorkerThread::detachAllClients() {
+    // Collect client info and detach fds
+    // This runs in the worker thread, so it's safe to access connections_
+    detached_infos_.clear();
+
+    std::vector<int> fds;
+    for (auto& [fd, conn] : connections_) {
+        ClientConnInfo info;
+        info.fd = fd;
+        info.listen_port = conn->getListenPort();
+        info.authenticated = conn->isAuthenticated();
+        info.stream_id = conn->getStreamId();
+        detached_infos_.push_back(info);
+
+        event_loop_.removeEvent(fd);
+        conn->detachFd();  // Prevent close on destruction
+        fds.push_back(fd);
+    }
+
+    // Now safe to clear - destructors won't close fds
+    connections_.clear();
+
+    // NOTE: Do NOT clear mux_pools_ here. The MUX backend connections may still have
+    // in-flight responses in the kernel buffer. They will be cleaned up when the
+    // old process exits. The new process creates its own MUX connections.
+
+    LOG_INFO("Worker %d: detached %zu client connections for hot upgrade", id_, fds.size());
 }
 
 void WorkerThread::closeBackendConnections(uint16_t listen_port) {

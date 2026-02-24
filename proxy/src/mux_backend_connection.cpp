@@ -304,10 +304,10 @@ void MuxBackendConnection::onConnectionError() {
     worker_->removeMuxConnection(this);
 }
 
-uint32_t MuxBackendConnection::createStream(ClientConnection* client) {
+uint64_t MuxBackendConnection::createStream(ClientConnection* client) {
     if (!canCreateStream()) return 0;
 
-    uint32_t stream_id = next_stream_id_;
+    uint64_t stream_id = next_stream_id_;
     next_stream_id_ += 2; // Odd IDs for client-initiated streams
 
     streams_[stream_id] = client;
@@ -318,12 +318,12 @@ uint32_t MuxBackendConnection::createStream(ClientConnection* client) {
         sendFrame(MUX_FRAME_STREAM_OPEN, stream_id, nullptr, 0);
     }
 
-    LOG_DEBUG("Created stream %u on backend %s:%d (active=%u)",
-              stream_id, addr_.c_str(), port_, active_stream_count_);
+    LOG_DEBUG("Created stream %llu on backend %s:%d (active=%u)",
+              (unsigned long long)stream_id, addr_.c_str(), port_, active_stream_count_);
     return stream_id;
 }
 
-void MuxBackendConnection::closeStream(uint32_t stream_id) {
+void MuxBackendConnection::closeStream(uint64_t stream_id) {
     auto it = streams_.find(stream_id);
     if (it == streams_.end()) return;
 
@@ -335,8 +335,8 @@ void MuxBackendConnection::closeStream(uint32_t stream_id) {
         sendFrame(MUX_FRAME_STREAM_CLOSE, stream_id, nullptr, 0);
     }
 
-    LOG_DEBUG("Closed stream %u on backend %s:%d (active=%u)",
-              stream_id, addr_.c_str(), port_, active_stream_count_);
+    LOG_DEBUG("Closed stream %llu on backend %s:%d (active=%u)",
+              (unsigned long long)stream_id, addr_.c_str(), port_, active_stream_count_);
 
     // If in GOAWAY state and no more streams, close the connection
     if (state_ == MuxConnState::GOAWAY && active_stream_count_ == 0) {
@@ -345,7 +345,7 @@ void MuxBackendConnection::closeStream(uint32_t stream_id) {
     }
 }
 
-ClientConnection* MuxBackendConnection::getStreamClient(uint32_t stream_id) const {
+ClientConnection* MuxBackendConnection::getStreamClient(uint64_t stream_id) const {
     auto it = streams_.find(stream_id);
     return (it != streams_.end()) ? it->second : nullptr;
 }
@@ -353,11 +353,10 @@ ClientConnection* MuxBackendConnection::getStreamClient(uint32_t stream_id) cons
 bool MuxBackendConnection::canCreateStream() const {
     if (state_ != MuxConnState::READY) return false;
     if (active_stream_count_ >= max_streams_) return false;
-    if (next_stream_id_ > 0xFFFFFFF0) return false; // Near overflow
     return true;
 }
 
-void MuxBackendConnection::sendData(uint32_t stream_id, const char* data, size_t len) {
+void MuxBackendConnection::sendData(uint64_t stream_id, const char* data, size_t len) {
     if (mux_enabled_) {
         sendFrame(MUX_FRAME_DATA, stream_id, data, len);
     } else {
@@ -370,7 +369,7 @@ void MuxBackendConnection::sendData(uint32_t stream_id, const char* data, size_t
     }
 }
 
-void MuxBackendConnection::sendFrame(uint8_t type, uint32_t stream_id,
+void MuxBackendConnection::sendFrame(uint8_t type, uint64_t stream_id,
                                       const char* payload, size_t payload_len) {
     unsigned char header[MUX_FRAME_HEADER_SIZE];
     encodeFrameHeader(header, type, stream_id, (uint32_t)payload_len);
@@ -383,48 +382,36 @@ void MuxBackendConnection::sendFrame(uint8_t type, uint32_t stream_id,
     if (fd_ >= 0) {
         worker_->getEventLoop().modifyEvent(fd_, EVENT_READABLE | EVENT_WRITABLE);
     }
-
-    // Check for stream ID exhaustion
-    if (next_stream_id_ > 0xFFFFFFF0 && state_ == MuxConnState::READY) {
-        LOG_WARN("Stream ID near exhaustion on backend %s:%d, sending GOAWAY",
-                 addr_.c_str(), port_);
-        state_ = MuxConnState::GOAWAY;
-        uint32_t last_id = next_stream_id_ - 2;
-        unsigned char goaway_payload[4];
-        goaway_payload[0] = (last_id >> 24) & 0xFF;
-        goaway_payload[1] = (last_id >> 16) & 0xFF;
-        goaway_payload[2] = (last_id >> 8) & 0xFF;
-        goaway_payload[3] = last_id & 0xFF;
-        // Don't recurse: directly encode the frame
-        unsigned char gh[MUX_FRAME_HEADER_SIZE];
-        encodeFrameHeader(gh, MUX_FRAME_GOAWAY, 0, 4);
-        send_buf_.insert(send_buf_.end(), gh, gh + MUX_FRAME_HEADER_SIZE);
-        send_buf_.insert(send_buf_.end(), goaway_payload, goaway_payload + 4);
-    }
 }
 
 void MuxBackendConnection::encodeFrameHeader(unsigned char* buf, uint8_t flags,
-                                               uint32_t stream_id, uint32_t payload_len) {
+                                               uint64_t stream_id, uint32_t payload_len) {
     buf[0] = MUX_FRAME_MAGIC;
     buf[1] = flags;
-    buf[2] = (stream_id >> 24) & 0xFF;
-    buf[3] = (stream_id >> 16) & 0xFF;
-    buf[4] = (stream_id >> 8) & 0xFF;
-    buf[5] = stream_id & 0xFF;
-    buf[6] = (payload_len >> 24) & 0xFF;
-    buf[7] = (payload_len >> 16) & 0xFF;
-    buf[8] = (payload_len >> 8) & 0xFF;
-    buf[9] = payload_len & 0xFF;
+    buf[2] = (stream_id >> 56) & 0xFF;
+    buf[3] = (stream_id >> 48) & 0xFF;
+    buf[4] = (stream_id >> 40) & 0xFF;
+    buf[5] = (stream_id >> 32) & 0xFF;
+    buf[6] = (stream_id >> 24) & 0xFF;
+    buf[7] = (stream_id >> 16) & 0xFF;
+    buf[8] = (stream_id >> 8) & 0xFF;
+    buf[9] = stream_id & 0xFF;
+    buf[10] = (payload_len >> 24) & 0xFF;
+    buf[11] = (payload_len >> 16) & 0xFF;
+    buf[12] = (payload_len >> 8) & 0xFF;
+    buf[13] = payload_len & 0xFF;
 }
 
 bool MuxBackendConnection::decodeFrameHeader(const unsigned char* buf, uint8_t& flags,
-                                               uint32_t& stream_id, uint32_t& payload_len) {
+                                               uint64_t& stream_id, uint32_t& payload_len) {
     if (buf[0] != MUX_FRAME_MAGIC) return false;
     flags = buf[1];
-    stream_id = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16) |
-                ((uint32_t)buf[4] << 8) | (uint32_t)buf[5];
-    payload_len = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) |
-                  ((uint32_t)buf[8] << 8) | (uint32_t)buf[9];
+    stream_id = ((uint64_t)buf[2] << 56) | ((uint64_t)buf[3] << 48) |
+                ((uint64_t)buf[4] << 40) | ((uint64_t)buf[5] << 32) |
+                ((uint64_t)buf[6] << 24) | ((uint64_t)buf[7] << 16) |
+                ((uint64_t)buf[8] << 8) | (uint64_t)buf[9];
+    payload_len = ((uint32_t)buf[10] << 24) | ((uint32_t)buf[11] << 16) |
+                  ((uint32_t)buf[12] << 8) | (uint32_t)buf[13];
     return true;
 }
 
@@ -492,7 +479,7 @@ void MuxBackendConnection::processRecvBuffer() {
     }
 }
 
-void MuxBackendConnection::handleFrame(uint8_t type, uint32_t stream_id,
+void MuxBackendConnection::handleFrame(uint8_t type, uint64_t stream_id,
                                         const char* payload, size_t len) {
     switch (type) {
         case MUX_FRAME_DATA: {
@@ -515,8 +502,8 @@ void MuxBackendConnection::handleFrame(uint8_t type, uint32_t stream_id,
             if (client) {
                 client->appendToSendBuffer(payload, len);
             } else {
-                LOG_WARN("DATA frame for unknown stream %u on backend %s:%d",
-                         stream_id, addr_.c_str(), port_);
+                LOG_WARN("DATA frame for unknown stream %llu on backend %s:%d",
+                         (unsigned long long)stream_id, addr_.c_str(), port_);
             }
             break;
         }
@@ -579,7 +566,7 @@ void MuxBackendConnection::flushPendingStreams() {
     pending_clients_.clear();
 
     for (auto* client : pending) {
-        uint32_t sid = createStream(client);
+        uint64_t sid = createStream(client);
         if (sid == 0) {
             LOG_ERROR("Failed to create stream for pending client fd=%d", client->getFd());
             client->sendError("ERR backend stream creation failed");

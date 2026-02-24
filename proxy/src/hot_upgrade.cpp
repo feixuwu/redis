@@ -1,6 +1,7 @@
 // HotUpgradeManager implementation
 #include "hot_upgrade.h"
 #include "proxy_server.h"
+#include "worker_thread.h"
 #include "logger.h"
 
 #include <sys/socket.h>
@@ -11,6 +12,7 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 namespace proxy {
 
@@ -23,10 +25,7 @@ constexpr uint8_t MSG_TRANSFER_DONE = 0x05;
 constexpr uint8_t MSG_ACK           = 0x06;
 constexpr uint8_t MSG_ROLLBACK      = 0x07;
 
-static constexpr int MAX_FDS_PER_MSG = 1;
-
 HotUpgradeManager::HotUpgradeManager(ProxyServer* server) : server_(server) {
-    socket_path_ = server_->getConfig().getHotUpgradeConfig().socket_path;
 }
 
 HotUpgradeManager::~HotUpgradeManager() {
@@ -42,6 +41,7 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
         return false;
     }
 
+    socket_path_ = server_->getConfig().getHotUpgradeConfig().socket_path;
     state_ = UpgradeState::TRANSFERRING;
     LOG_INFO("Starting hot upgrade...");
 
@@ -77,7 +77,6 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
     // Step 2: Determine binary path
     std::string binary = new_binary_path;
     if (binary.empty()) {
-        // Use /proc/self/exe
         char exe_path[1024];
         ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
         if (len <= 0) {
@@ -91,7 +90,13 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
         binary = exe_path;
     }
 
-    // Step 3: Fork and exec new process
+    // Step 3: Build command line for new process
+    // Pass config file and upgrade-from flag
+    std::string config_arg = "-c";
+    // Try to get config path (use default if not available)
+    std::string config_path = "proxy.yaml";
+
+    // Step 4: Fork and exec new process
     pid_t pid = fork();
     if (pid < 0) {
         LOG_ERROR("fork() failed: %s", strerror(errno));
@@ -102,16 +107,25 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
     }
 
     if (pid == 0) {
-        // Child process: exec new binary with --upgrade-from flag
+        // Child process: exec new binary with --upgrade-from flag and config path
         std::string upgrade_arg = "--upgrade-from=" + socket_path_;
-        execl(binary.c_str(), binary.c_str(), upgrade_arg.c_str(), nullptr);
+        std::string cfg_path = server_->getConfig().getConfigPath();
+        if (!cfg_path.empty()) {
+            execl(binary.c_str(), binary.c_str(),
+                  "-c", cfg_path.c_str(),
+                  upgrade_arg.c_str(), nullptr);
+        } else {
+            execl(binary.c_str(), binary.c_str(),
+                  upgrade_arg.c_str(), nullptr);
+        }
         // If exec fails
+        LOG_ERROR("execl failed: %s", strerror(errno));
         _exit(1);
     }
 
-    LOG_INFO("Forked new process pid=%d", pid);
+    LOG_INFO("Forked new process pid=%d, binary=%s", pid, binary.c_str());
 
-    // Step 4: Wait for new process to connect
+    // Step 5: Wait for new process to connect
     uint32_t timeout = server_->getConfig().getHotUpgradeConfig().timeout;
 
     struct timeval tv;
@@ -133,10 +147,10 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
     ::close(server_fd);
     uds_fd_ = client_fd;
 
-    // Step 5: Wait for handshake from new process
+    // Step 6: Wait for handshake from new process
     uint8_t msg_type = 0;
     if (::read(uds_fd_, &msg_type, 1) != 1 || msg_type != MSG_HANDSHAKE) {
-        LOG_ERROR("Invalid handshake from new process");
+        LOG_ERROR("Invalid handshake from new process (got type=%d)", msg_type);
         ::close(uds_fd_);
         uds_fd_ = -1;
         unlink(socket_path_.c_str());
@@ -149,19 +163,112 @@ bool HotUpgradeManager::startUpgrade(const std::string& new_binary_path) {
     // Send handshake ACK
     msg_type = MSG_HANDSHAKE_ACK;
     ::write(uds_fd_, &msg_type, 1);
-
     LOG_INFO("Handshake complete with new process");
 
-    // Step 6: Transfer all listen fds with metadata
-    // Note: In a full implementation, we would iterate all listen_fds_ and
-    // client connections, sending each one with its metadata.
-    // For now, send TRANSFER_DONE to signal completion.
+    // Step 7: Transfer all listen fds with metadata
+    const auto& listen_fds = server_->getListenFds();
+    for (const auto& [fd, port] : listen_fds) {
+        msg_type = MSG_LISTEN_FD;
+        ::write(uds_fd_, &msg_type, 1);
 
+        ConnectionMetadata meta{};
+        meta.fd = fd;
+        meta.listen_port = port;
+        meta.authenticated = false;
+        meta.stream_id = 0;
+        meta.backend_port = 0;
+        meta.recv_buf_len = 0;
+        meta.send_buf_len = 0;
+        memset(meta.backend_addr, 0, sizeof(meta.backend_addr));
+
+        if (!sendFd(uds_fd_, fd, &meta, sizeof(meta))) {
+            LOG_ERROR("Failed to send listen fd=%d for port=%d", fd, port);
+        } else {
+            LOG_INFO("Sent listen fd=%d for port=%d", fd, port);
+        }
+    }
+
+    // Step 7b: Collect and transfer all client fds from workers
+    // First stop accepting new connections on listen fds
+    LOG_INFO("Collecting client connections from all workers...");
+    int total_client_fds = 0;
+    const auto& workers = server_->getWorkers();
+
+    // Phase 1: Dispatch pause reads to all workers (thread-safe)
+    for (const auto& worker : workers) {
+        worker->dispatchPauseReads();
+    }
+    // Wait for all workers to complete pause
+    for (const auto& worker : workers) {
+        worker->waitPauseDone(500);
+    }
+
+    // Phase 2: Wait for in-flight requests to complete
+    // Now workers have stopped reading from client fds, but can still write responses.
+    // Give time for any pending Redis responses to be forwarded back to clients.
+    usleep(100000); // 100ms
+
+    // Phase 3: Dispatch detach to all workers (thread-safe)
+    for (const auto& worker : workers) {
+        worker->dispatchDetachAll();
+    }
+    // Wait for all workers to complete detach
+    for (const auto& worker : workers) {
+        worker->waitDetachDone(500);
+    }
+
+    // Phase 4: Collect client infos from workers (safe now - detach is done)
+    struct ClientFdInfo {
+        int fd;
+        uint16_t listen_port;
+        bool authenticated;
+        uint64_t stream_id;
+    };
+    std::vector<ClientFdInfo> all_clients;
+
+    for (const auto& worker : workers) {
+        auto infos = worker->getDetachedInfos();
+        for (const auto& info : infos) {
+            all_clients.push_back({info.fd, info.listen_port, info.authenticated, info.stream_id});
+        }
+    }
+
+    LOG_INFO("Transferring %zu client fds...", all_clients.size());
+
+    // Now send all client fds
+    for (const auto& ci : all_clients) {
+        msg_type = MSG_CLIENT_FD;
+        ::write(uds_fd_, &msg_type, 1);
+
+        ConnectionMetadata meta{};
+        meta.fd = ci.fd;
+        meta.listen_port = ci.listen_port;
+        meta.authenticated = ci.authenticated;
+        meta.stream_id = ci.stream_id;
+        meta.backend_port = 0;
+        meta.recv_buf_len = 0;
+        meta.send_buf_len = 0;
+        memset(meta.backend_addr, 0, sizeof(meta.backend_addr));
+
+        if (!sendFd(uds_fd_, ci.fd, &meta, sizeof(meta))) {
+            LOG_ERROR("Failed to send client fd=%d for port=%d", ci.fd, ci.listen_port);
+            ::close(ci.fd);
+        } else {
+            total_client_fds++;
+            // Close our copy of the fd - new process has it now
+            ::close(ci.fd);
+        }
+    }
+
+    LOG_INFO("Transferred %d client fds", total_client_fds);
+
+    // Step 8: Signal transfer done
     state_ = UpgradeState::WAITING_ACK;
     msg_type = MSG_TRANSFER_DONE;
     ::write(uds_fd_, &msg_type, 1);
+    LOG_INFO("All fds transferred, waiting for ACK from new process...");
 
-    // Step 7: Wait for ACK with timeout
+    // Step 9: Wait for ACK with timeout
     tv.tv_sec = timeout;
     tv.tv_usec = 0;
     setsockopt(uds_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -202,7 +309,20 @@ bool HotUpgradeManager::receiveFromOldProcess(const std::string& socket_path) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
-    if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    // Retry connection a few times (old process may not be ready yet)
+    int retries = 5;
+    while (retries > 0) {
+        if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            break;
+        }
+        retries--;
+        if (retries > 0) {
+            LOG_INFO("Retrying connection to old process (%d retries left)...", retries);
+            usleep(200000); // 200ms
+        }
+    }
+
+    if (retries == 0) {
         LOG_ERROR("Failed to connect to old process UDS: %s", strerror(errno));
         ::close(fd);
         return false;
@@ -225,6 +345,9 @@ bool HotUpgradeManager::receiveFromOldProcess(const std::string& socket_path) {
     LOG_INFO("Handshake with old process successful");
 
     // Receive fds and metadata
+    int received_listen_fds = 0;
+    int received_client_fds = 0;
+
     while (true) {
         if (::read(uds_fd_, &msg_type, 1) != 1) {
             LOG_ERROR("Failed to read message type from old process");
@@ -232,23 +355,51 @@ bool HotUpgradeManager::receiveFromOldProcess(const std::string& socket_path) {
         }
 
         if (msg_type == MSG_TRANSFER_DONE) {
-            LOG_INFO("Transfer from old process complete");
+            LOG_INFO("Transfer from old process complete: %d listen fds, %d client fds",
+                     received_listen_fds, received_client_fds);
             break;
         }
 
         if (msg_type == MSG_LISTEN_FD) {
             // Receive listen fd and metadata
-            // Implementation: recvFd + restore listen socket
-            LOG_INFO("Received listen fd from old process");
+            ConnectionMetadata meta{};
+            int received_fd = recvFd(uds_fd_, &meta, sizeof(meta));
+            if (received_fd >= 0) {
+                received_listen_fds++;
+                LOG_INFO("Received listen fd=%d for port=%d (original fd=%d)",
+                         received_fd, meta.listen_port, meta.fd);
+                // New process already has its own listen sockets from init()
+                ::close(received_fd);
+            } else {
+                LOG_ERROR("Failed to receive listen fd");
+            }
         } else if (msg_type == MSG_CLIENT_FD) {
             // Receive client fd and metadata
-            // Implementation: recvFd + restore client connection
-            LOG_INFO("Received client fd from old process");
+            ConnectionMetadata meta{};
+            int received_fd = recvFd(uds_fd_, &meta, sizeof(meta));
+            if (received_fd >= 0) {
+                received_client_fds++;
+                // Dispatch client fd to a worker via round-robin
+                const auto& workers = server_->getWorkers();
+                if (!workers.empty()) {
+                    int worker_idx = received_client_fds % workers.size();
+                    workers[worker_idx]->dispatchClient(received_fd, meta.listen_port);
+                    LOG_DEBUG("Restored client fd=%d to worker %d (port=%d)",
+                             received_fd, worker_idx, meta.listen_port);
+                } else {
+                    LOG_ERROR("No workers available to restore client fd=%d", received_fd);
+                    ::close(received_fd);
+                }
+            } else {
+                LOG_ERROR("Failed to receive client fd");
+            }
         } else if (msg_type == MSG_ROLLBACK) {
             LOG_WARN("Old process requested rollback");
             ::close(uds_fd_);
             uds_fd_ = -1;
             return false;
+        } else {
+            LOG_WARN("Unknown message type: %d", msg_type);
         }
     }
 

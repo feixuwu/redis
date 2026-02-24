@@ -54,6 +54,27 @@ public:
     BackendManager* getBackendManager() { return backend_mgr_; }
     bool isMuxEnabled() const { return mux_enabled_; }
 
+    // Hot upgrade support: get info about all active client connections
+    struct ClientConnInfo {
+        int fd;
+        uint16_t listen_port;
+        bool authenticated;
+        uint64_t stream_id;
+    };
+    std::vector<ClientConnInfo> getClientConnInfos() const;
+
+    // Hot upgrade: dispatch pause reads task to worker thread (thread-safe)
+    void dispatchPauseReads();
+    // Wait for pause reads to complete
+    bool waitPauseDone(int timeout_ms = 500);
+
+    // Hot upgrade: dispatch detach all clients task to worker thread (thread-safe)
+    void dispatchDetachAll();
+    // Wait for detach to complete
+    bool waitDetachDone(int timeout_ms = 500);
+    // Get the detached client infos (after detach completed)
+    std::vector<ClientConnInfo> getDetachedInfos();
+
     // Statistics
     size_t getMuxConnectionCount() const;
     size_t getTotalStreamCount() const;
@@ -83,11 +104,18 @@ private:
     int notify_fd_ = -1;
 
     struct PendingTask {
-        enum Type { NEW_CLIENT, CLOSE_BACKEND };
+        enum Type { NEW_CLIENT, CLOSE_BACKEND, PAUSE_READS, DETACH_ALL };
         Type type;
         int fd = -1;
         uint16_t listen_port = 0;
     };
+
+    // Atomic flag: set after pause/detach completes in worker thread
+    std::atomic<bool> pause_done_{false};
+    std::atomic<bool> detach_done_{false};
+
+    // Storage for detached client fd infos (filled during DETACH_ALL)
+    std::vector<ClientConnInfo> detached_infos_;
 
     std::mutex pending_mutex_;
     std::vector<PendingTask> pending_tasks_;
@@ -102,6 +130,8 @@ private:
     void processPendingTasks();
     void handleNewClient(int client_fd, uint16_t listen_port);
     void closeBackendConnections(uint16_t listen_port);
+    void pauseClientReads();    // Internal: runs in worker thread
+    void detachAllClients();    // Internal: runs in worker thread
 };
 
 } // namespace proxy

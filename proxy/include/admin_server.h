@@ -55,6 +55,7 @@ private:
     void handleProxyBackend(AdminClient* client, const std::vector<std::string>& args);
     void handleProxyConnections(AdminClient* client);
     void handleProxyUpgrade(AdminClient* client, const std::vector<std::string>& args);
+    void handleProxyWorker(AdminClient* client, const std::vector<std::string>& args);
     void handleProxyLogLevel(AdminClient* client, const std::vector<std::string>& args);
 
     // RESP encoding helpers

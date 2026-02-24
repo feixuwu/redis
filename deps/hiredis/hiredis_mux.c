@@ -39,7 +39,7 @@ redisContextFuncs redisContextMuxFuncs;
 /* ========================== MUX Private Context ========================== */
 
 typedef struct redisMux {
-    uint32_t stream_id;         /* Our stream ID */
+    uint64_t stream_id;         /* Our stream ID */
 
     /* Receive buffer: raw bytes from socket, MUX frames not yet fully received */
     char *recvbuf;
@@ -79,29 +79,35 @@ static int muxBufGrow(char **buf, size_t *alloc, size_t len, size_t needed) {
 
 /* Encode a MUX frame header into buf (must be at least 10 bytes) */
 static void muxEncodeHeader(unsigned char *buf, uint8_t flags,
-                            uint32_t stream_id, uint32_t payload_len) {
+                            uint64_t stream_id, uint32_t payload_len) {
     buf[0] = HIREDIS_MUX_FRAME_MAGIC;
     buf[1] = flags;
-    buf[2] = (stream_id >> 24) & 0xFF;
-    buf[3] = (stream_id >> 16) & 0xFF;
-    buf[4] = (stream_id >> 8)  & 0xFF;
-    buf[5] = stream_id & 0xFF;
-    buf[6] = (payload_len >> 24) & 0xFF;
-    buf[7] = (payload_len >> 16) & 0xFF;
-    buf[8] = (payload_len >> 8)  & 0xFF;
-    buf[9] = payload_len & 0xFF;
+    buf[2] = (stream_id >> 56) & 0xFF;
+    buf[3] = (stream_id >> 48) & 0xFF;
+    buf[4] = (stream_id >> 40) & 0xFF;
+    buf[5] = (stream_id >> 32) & 0xFF;
+    buf[6] = (stream_id >> 24) & 0xFF;
+    buf[7] = (stream_id >> 16) & 0xFF;
+    buf[8] = (stream_id >> 8)  & 0xFF;
+    buf[9] = stream_id & 0xFF;
+    buf[10] = (payload_len >> 24) & 0xFF;
+    buf[11] = (payload_len >> 16) & 0xFF;
+    buf[12] = (payload_len >> 8)  & 0xFF;
+    buf[13] = payload_len & 0xFF;
 }
 
 /* Decode a MUX frame header from buf. Returns 0 on success, -1 on error. */
 static int muxDecodeHeader(const unsigned char *buf, uint8_t *flags,
-                           uint32_t *stream_id, uint32_t *payload_len) {
+                           uint64_t *stream_id, uint32_t *payload_len) {
     if (buf[0] != HIREDIS_MUX_FRAME_MAGIC) return -1;
 
     *flags = buf[1];
-    *stream_id = ((uint32_t)buf[2] << 24) | ((uint32_t)buf[3] << 16) |
-                 ((uint32_t)buf[4] << 8)  | (uint32_t)buf[5];
-    *payload_len = ((uint32_t)buf[6] << 24) | ((uint32_t)buf[7] << 16) |
-                   ((uint32_t)buf[8] << 8)  | (uint32_t)buf[9];
+    *stream_id = ((uint64_t)buf[2] << 56) | ((uint64_t)buf[3] << 48) |
+                 ((uint64_t)buf[4] << 40) | ((uint64_t)buf[5] << 32) |
+                 ((uint64_t)buf[6] << 24) | ((uint64_t)buf[7] << 16) |
+                 ((uint64_t)buf[8] << 8)  | (uint64_t)buf[9];
+    *payload_len = ((uint32_t)buf[10] << 24) | ((uint32_t)buf[11] << 16) |
+                   ((uint32_t)buf[12] << 8)  | (uint32_t)buf[13];
     return 0;
 }
 
@@ -113,7 +119,8 @@ static int muxParseFrames(redisMux *mux) {
 
     while (pos + HIREDIS_MUX_FRAME_HEADER_SIZE <= mux->recvbuf_len) {
         uint8_t flags;
-        uint32_t stream_id, payload_len;
+        uint64_t stream_id;
+        uint32_t payload_len;
 
         if (muxDecodeHeader((unsigned char *)mux->recvbuf + pos,
                            &flags, &stream_id, &payload_len) != 0) {
@@ -363,7 +370,7 @@ redisContextFuncs redisContextMuxFuncs = {
 
 /* ========================== Public API ========================== */
 
-int redisEnableMux(redisContext *c, uint32_t stream_id) {
+int redisEnableMux(redisContext *c, uint64_t stream_id) {
     if (!c) return REDIS_ERR;
 
     /* Must be a connected blocking context */
@@ -415,7 +422,7 @@ int redisEnableMux(redisContext *c, uint32_t stream_id) {
 typedef struct {
     redisCallbackFn *user_fn;
     void *user_privdata;
-    uint32_t stream_id;
+    uint64_t stream_id;
 } redisMuxAsyncHandshake;
 
 static void redisMuxAsyncHandshakeCb(redisAsyncContext *ac, void *r, void *privdata) {
@@ -450,7 +457,7 @@ static void redisMuxAsyncHandshakeCb(redisAsyncContext *ac, void *r, void *privd
     hi_free(hs);
 }
 
-int redisAsyncEnableMux(redisAsyncContext *ac, uint32_t stream_id,
+int redisAsyncEnableMux(redisAsyncContext *ac, uint64_t stream_id,
                         redisCallbackFn *fn, void *privdata) {
     if (!ac) return REDIS_ERR;
 
@@ -470,7 +477,7 @@ int redisAsyncEnableMux(redisAsyncContext *ac, uint32_t stream_id,
                              "HELLO 3 MULTIPLEX");
 }
 
-int redisActivateMux(redisContext *c, uint32_t stream_id) {
+int redisActivateMux(redisContext *c, uint64_t stream_id) {
     if (!c) return REDIS_ERR;
 
     /* Don't enable twice */
@@ -513,7 +520,7 @@ int redisActivateMux(redisContext *c, uint32_t stream_id) {
     return REDIS_OK;
 }
 
-uint32_t redisGetMuxStreamId(redisContext *c) {
+uint64_t redisGetMuxStreamId(redisContext *c) {
     if (!c || c->funcs != &redisContextMuxFuncs || !c->privctx) return 0;
     return ((redisMux *)c->privctx)->stream_id;
 }

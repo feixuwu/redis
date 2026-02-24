@@ -52,7 +52,7 @@ private:
         int fd;
         uint16_t listen_port;
         bool authenticated;
-        uint32_t stream_id;
+        uint64_t stream_id;
         char backend_addr[64];
         uint16_t backend_port;
         uint32_t recv_buf_len;

@@ -57,7 +57,7 @@
 #define MUX_DEFAULT_STREAMS 10  /* Default number of mux streams per connection */
 
 /* MUX frame constants for benchmark-level frame encode/decode */
-#define BENCH_MUX_HEADER_SIZE 10
+#define BENCH_MUX_HEADER_SIZE 14
 #define BENCH_MUX_MAGIC       0xAA
 #define BENCH_MUX_FRAME_DATA  0x01
 #define BENCH_MUX_TYPE_MASK   0x0F
@@ -145,7 +145,7 @@ typedef struct _client {
     int slots_last_update;
     /* MUX mode state */
     int mux_hello_done;     /* Whether MUX HELLO handshake reply has been consumed */
-    uint32_t mux_stream_id; /* Stream ID for this client in MUX shared connection */
+    uint64_t mux_stream_id; /* Stream ID for this client in MUX shared connection */
     muxSharedConn *mux_conn; /* Back-pointer to shared MUX connection (NULL if not MUX) */
     redisReader *mux_reader; /* Per-client RESP reader for MUX mode (parses demuxed data) */
 } *client;
@@ -162,7 +162,7 @@ struct muxSharedConn {
     /* Client registry: stream_id -> client mapping */
     client *clients[1024];      /* Direct-mapped: clients[stream_id/2] (stream_id=1,3,5...) */
     int num_clients;            /* Number of registered clients */
-    uint32_t next_stream_id;    /* Next stream ID to assign (1,3,5...) */
+    uint64_t next_stream_id;    /* Next stream ID to assign (1,3,5...) */
 
     /* Write queue: clients that need their obuf flushed via MUX frames */
     client **write_queue;       /* Array of clients needing write */
@@ -179,7 +179,7 @@ struct muxSharedConn {
     unsigned char frame_header[BENCH_MUX_HEADER_SIZE];
     int header_bytes_read;
     uint8_t current_flags;
-    uint32_t current_stream_id;
+    uint64_t current_stream_id;
     uint32_t current_payload_len;
     char *payload_buf;
     size_t payload_buf_len;
@@ -410,17 +410,21 @@ static void freeRedisConfig(redisConfig *cfg) {
 
 /* Encode a MUX frame header into buf (must be >= BENCH_MUX_HEADER_SIZE bytes) */
 static void benchMuxEncodeHeader(unsigned char *buf, uint8_t flags,
-                                  uint32_t stream_id, uint32_t payload_len) {
+                                  uint64_t stream_id, uint32_t payload_len) {
     buf[0] = BENCH_MUX_MAGIC;
     buf[1] = flags;
-    buf[2] = (stream_id >> 24) & 0xFF;
-    buf[3] = (stream_id >> 16) & 0xFF;
-    buf[4] = (stream_id >> 8) & 0xFF;
-    buf[5] = stream_id & 0xFF;
-    buf[6] = (payload_len >> 24) & 0xFF;
-    buf[7] = (payload_len >> 16) & 0xFF;
-    buf[8] = (payload_len >> 8) & 0xFF;
-    buf[9] = payload_len & 0xFF;
+    buf[2] = (stream_id >> 56) & 0xFF;
+    buf[3] = (stream_id >> 48) & 0xFF;
+    buf[4] = (stream_id >> 40) & 0xFF;
+    buf[5] = (stream_id >> 32) & 0xFF;
+    buf[6] = (stream_id >> 24) & 0xFF;
+    buf[7] = (stream_id >> 16) & 0xFF;
+    buf[8] = (stream_id >> 8) & 0xFF;
+    buf[9] = stream_id & 0xFF;
+    buf[10] = (payload_len >> 24) & 0xFF;
+    buf[11] = (payload_len >> 16) & 0xFF;
+    buf[12] = (payload_len >> 8) & 0xFF;
+    buf[13] = payload_len & 0xFF;
 }
 
 /* Helper: grow a dynamic buffer */
@@ -535,7 +539,7 @@ static void muxSharedConnFree(muxSharedConn *mc) {
 
 /* Register a client (with its stream_id) in the shared connection's lookup table */
 static void muxSharedConnRegisterClient(muxSharedConn *mc, client c) {
-    uint32_t idx = c->mux_stream_id / 2; /* stream_id 1->0, 3->1, 5->2, etc. */
+    uint64_t idx = c->mux_stream_id / 2; /* stream_id 1->0, 3->1, 5->2, etc. */
     if (idx < 1024) {
         mc->clients[idx] = c;
     }
@@ -543,8 +547,8 @@ static void muxSharedConnRegisterClient(muxSharedConn *mc, client c) {
 }
 
 /* Look up a client by stream_id */
-static client muxSharedConnLookupClient(muxSharedConn *mc, uint32_t stream_id) {
-    uint32_t idx = stream_id / 2;
+static client muxSharedConnLookupClient(muxSharedConn *mc, uint64_t stream_id) {
+    uint64_t idx = stream_id / 2;
     if (idx < 1024) return mc->clients[idx];
     return NULL;
 }
@@ -584,14 +588,18 @@ static void muxSharedConnProcessFrames(muxSharedConn *mc) {
                 exit(1);
             }
             mc->current_flags = mc->frame_header[1];
-            mc->current_stream_id = ((uint32_t)mc->frame_header[2] << 24) |
-                                    ((uint32_t)mc->frame_header[3] << 16) |
-                                    ((uint32_t)mc->frame_header[4] << 8) |
-                                    (uint32_t)mc->frame_header[5];
-            mc->current_payload_len = ((uint32_t)mc->frame_header[6] << 24) |
-                                      ((uint32_t)mc->frame_header[7] << 16) |
-                                      ((uint32_t)mc->frame_header[8] << 8) |
-                                      (uint32_t)mc->frame_header[9];
+            mc->current_stream_id = ((uint64_t)mc->frame_header[2] << 56) |
+                                    ((uint64_t)mc->frame_header[3] << 48) |
+                                    ((uint64_t)mc->frame_header[4] << 40) |
+                                    ((uint64_t)mc->frame_header[5] << 32) |
+                                    ((uint64_t)mc->frame_header[6] << 24) |
+                                    ((uint64_t)mc->frame_header[7] << 16) |
+                                    ((uint64_t)mc->frame_header[8] << 8) |
+                                    (uint64_t)mc->frame_header[9];
+            mc->current_payload_len = ((uint32_t)mc->frame_header[10] << 24) |
+                                      ((uint32_t)mc->frame_header[11] << 16) |
+                                      ((uint32_t)mc->frame_header[12] << 8) |
+                                      (uint32_t)mc->frame_header[13];
             mc->header_bytes_read = 0;
 
             if (mc->current_payload_len == 0) {
@@ -796,7 +804,7 @@ static void freeClient(client c) {
             }
         }
         /* Unregister from shared conn */
-        uint32_t idx = c->mux_stream_id / 2;
+        uint64_t idx = c->mux_stream_id / 2;
         if (idx < 1024 && c->mux_conn->clients[idx] == c)
             c->mux_conn->clients[idx] = NULL;
         c->mux_conn->num_clients--;

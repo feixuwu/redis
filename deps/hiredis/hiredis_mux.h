@@ -22,15 +22,15 @@ extern "C" {
 #endif
 
 /* ========================== MUX Frame Format ==========================
- * +--------+--------+--------+--------+--------+--------+-----------+
+ * +--------+--------+------------------+--------+--------+-----------+
  * | Magic  | Flags  |     Stream ID    |    Payload Len  | Payload   |
- * | 1 byte | 1 byte |     4 bytes      |    4 bytes      | N bytes   |
- * +--------+--------+--------+--------+--------+--------+-----------+
- *  Total Header: 10 bytes
+ * | 1 byte | 1 byte |     8 bytes      |    4 bytes      | N bytes   |
+ * +--------+--------+------------------+--------+--------+-----------+
+ *  Total Header: 14 bytes
  */
 
 /* Frame header size */
-#define HIREDIS_MUX_FRAME_HEADER_SIZE 10
+#define HIREDIS_MUX_FRAME_HEADER_SIZE 14
 
 /* Magic byte for frame synchronization */
 #define HIREDIS_MUX_FRAME_MAGIC 0xAA
@@ -64,7 +64,7 @@ extern "C" {
  *                  client-initiated streams). If 0, defaults to 1.
  * @return REDIS_OK on success, REDIS_ERR on failure (check c->err/c->errstr).
  */
-int redisEnableMux(redisContext *c, uint32_t stream_id);
+int redisEnableMux(redisContext *c, uint64_t stream_id);
 
 /**
  * Enable MUX mode on an async redisAsyncContext.
@@ -79,7 +79,7 @@ int redisEnableMux(redisContext *c, uint32_t stream_id);
  * @param privdata  User privdata passed to fn.
  * @return REDIS_OK on success, REDIS_ERR on failure.
  */
-int redisAsyncEnableMux(redisAsyncContext *ac, uint32_t stream_id,
+int redisAsyncEnableMux(redisAsyncContext *ac, uint64_t stream_id,
                         redisCallbackFn *fn, void *privdata);
 
 /**
@@ -95,13 +95,13 @@ int redisAsyncEnableMux(redisAsyncContext *ac, uint32_t stream_id,
  *                  If 0, defaults to 1.
  * @return REDIS_OK on success, REDIS_ERR on failure (check c->err/c->errstr).
  */
-int redisActivateMux(redisContext *c, uint32_t stream_id);
+int redisActivateMux(redisContext *c, uint64_t stream_id);
 
 /**
  * Get the current MUX stream ID for this context.
  * Returns 0 if MUX is not enabled.
  */
-uint32_t redisGetMuxStreamId(redisContext *c);
+uint64_t redisGetMuxStreamId(redisContext *c);
 
 /**
  * Check if MUX mode is enabled on this context.

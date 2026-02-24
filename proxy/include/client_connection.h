@@ -31,13 +31,13 @@ public:
     uint16_t getListenPort() const { return listen_port_; }
     ClientState getState() const { return state_; }
     bool isAuthenticated() const { return state_ >= ClientState::AUTHENTICATED; }
-    uint32_t getStreamId() const { return stream_id_; }
+    uint64_t getStreamId() const { return stream_id_; }
     MuxBackendConnection* getBackendConn() const { return backend_conn_; }
     WorkerThread* getWorker() const { return worker_; }
 
     // State management
     void setAuthenticated() { state_ = ClientState::AUTHENTICATED; }
-    void setStreaming(MuxBackendConnection* conn, uint32_t stream_id);
+    void setStreaming(MuxBackendConnection* conn, uint64_t stream_id);
     void close();
 
     // I/O operations
@@ -51,6 +51,13 @@ public:
     bool hasPendingSend() const;
     void flushSendBuffer();
 
+    // Hot upgrade: release fd ownership (prevents close on destruction)
+    int detachFd() { int f = fd_; fd_ = -1; return f; }
+
+    // Hot upgrade: pause reading from this connection (in-flight drain)
+    void setPaused(bool paused) { paused_ = paused; }
+    bool isPaused() const { return paused_; }
+
 private:
     int fd_;
     uint16_t listen_port_;
@@ -59,12 +66,15 @@ private:
 
     // Backend binding
     MuxBackendConnection* backend_conn_ = nullptr;
-    uint32_t stream_id_ = 0;
+    uint64_t stream_id_ = 0;
 
     // Read/write buffers
     std::vector<char> recv_buf_;
     std::vector<char> send_buf_;
     size_t send_offset_ = 0;
+
+    // Hot upgrade: when true, onReadable() does nothing (drain mode)
+    bool paused_ = false;
 
     // Try to handle AUTH command from recv buffer
     // Returns true if data was consumed (AUTH handled or error sent)

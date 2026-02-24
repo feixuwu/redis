@@ -12,7 +12,7 @@ import sys
 import time
 
 # Frame constants
-MUX_FRAME_HEADER_SIZE = 10
+MUX_FRAME_HEADER_SIZE = 14
 MUX_FRAME_MAGIC = 0xAA
 MUX_FRAME_DATA = 0x01
 MUX_FRAME_STREAM_OPEN = 0x02
@@ -23,15 +23,15 @@ MUX_FRAME_GOAWAY = 0x06
 MUX_FRAME_BATCH = 0x07
 
 def encode_frame(flags, stream_id, payload):
-    """Encode a MUX frame: 10-byte header + payload."""
-    header = struct.pack('>BBII', MUX_FRAME_MAGIC, flags, stream_id, len(payload))
+    """Encode a MUX frame: 14-byte header + payload."""
+    header = struct.pack('>BBQI', MUX_FRAME_MAGIC, flags, stream_id, len(payload))
     return header + payload
 
 def decode_frame(data):
     """Decode a MUX frame from data. Returns (flags, stream_id, payload, consumed_bytes) or None."""
     if len(data) < MUX_FRAME_HEADER_SIZE:
         return None
-    magic, flags, stream_id, payload_len = struct.unpack('>BBII', data[:MUX_FRAME_HEADER_SIZE])
+    magic, flags, stream_id, payload_len = struct.unpack('>BBQI', data[:MUX_FRAME_HEADER_SIZE])
     if magic != MUX_FRAME_MAGIC:
         return None
     total = MUX_FRAME_HEADER_SIZE + payload_len
@@ -259,9 +259,79 @@ def test_basic_mux(host, port):
         if frames:
             check("SID=13 GET returns 'world'", b'world' in frames[0][2])
 
+        # Step 8: Test 64-bit stream IDs (beyond uint32 range)
+        print("\n--- Test 6: 64-bit stream IDs (beyond uint32 range) ---")
+
+        # Close some old streams to free up capacity
+        for sid in [3, 5, 7, 9, 11, 13]:
+            client.send_mux_close_stream(sid)
+        time.sleep(0.3)
+        client.recv_mux_frames(0.5)  # Drain any responses
+
+        # Use stream IDs that exceed 0xFFFFFFFF to prove 64-bit support
+        big_sid_1 = 0x100000001  # 4294967297 - just over uint32 max
+        big_sid_2 = 0x200000003  # 8589934595
+        big_sid_3 = 0xFFFFFFFFFFFFFFFD  # Near uint64 max (odd number)
+
+        client.send_mux_frame(big_sid_1, 'SET', 'big_sid_key1', 'value_big1')
+        client.send_mux_frame(big_sid_2, 'SET', 'big_sid_key2', 'value_big2')
+        client.send_mux_frame(big_sid_3, 'SET', 'big_sid_key3', 'value_big3')
+
+        time.sleep(0.5)
+        frames = client.recv_mux_frames()
+
+        big_sids = [f[1] for f in frames]
+        check("Received 3 frames for 64-bit SIDs", len(frames) == 3)
+        check(f"SID=0x{big_sid_1:X} present in responses", big_sid_1 in big_sids)
+        check(f"SID=0x{big_sid_2:X} present in responses", big_sid_2 in big_sids)
+        check(f"SID=0x{big_sid_3:X} present in responses", big_sid_3 in big_sids)
+
+        for flags, sid, payload in frames:
+            if sid == big_sid_1:
+                check(f"SID=0x{big_sid_1:X} SET response is +OK", b'+OK' in payload)
+            elif sid == big_sid_2:
+                check(f"SID=0x{big_sid_2:X} SET response is +OK", b'+OK' in payload)
+            elif sid == big_sid_3:
+                check(f"SID=0x{big_sid_3:X} SET response is +OK", b'+OK' in payload)
+
+        # Verify we can GET back the values using the same big stream IDs
+        # (reuse big_sid_1 which is already open)
+        client.send_mux_frame(big_sid_1, 'GET', 'big_sid_key1')
+        time.sleep(0.5)
+        frames = client.recv_mux_frames()
+        check(f"SID=0x{big_sid_1:X} GET returns 'value_big1'",
+              len(frames) >= 1 and b'value_big1' in frames[0][2])
+
+        # Verify another big stream ID
+        client.send_mux_frame(big_sid_3, 'GET', 'big_sid_key3')
+        time.sleep(0.5)
+        frames = client.recv_mux_frames()
+        check(f"SID=0x{big_sid_3:X} GET returns 'value_big3'",
+              len(frames) >= 1 and b'value_big3' in frames[0][2])
+
+        # Test batch with 64-bit stream IDs (reuse existing open streams)
+        print("\n--- Test 7: Batch with 64-bit stream IDs ---")
+        client.send_mux_batch([
+            (big_sid_2, ('GET', 'big_sid_key2')),
+            (big_sid_3, ('GET', 'big_sid_key3')),
+        ])
+        time.sleep(0.5)
+        frames = client.recv_mux_frames()
+        batch_big_sids = [f[1] for f in frames]
+        check("Received 2 batch frames for 64-bit SIDs", len(frames) == 2)
+        check(f"Batch SID=0x{big_sid_2:X} present", big_sid_2 in batch_big_sids)
+        check(f"Batch SID=0x{big_sid_3:X} present", big_sid_3 in batch_big_sids)
+
+        for flags, sid, payload in frames:
+            if sid == big_sid_2:
+                check(f"SID=0x{big_sid_2:X} GET returns 'value_big2'", b'value_big2' in payload)
+            elif sid == big_sid_3:
+                check(f"SID=0x{big_sid_3:X} GET returns 'value_big3'", b'value_big3' in payload)
+
         # Cleanup
         print("\n--- Cleanup ---")
-        client.send_mux_frame(15, 'DEL', 'mux_key1', 'mux_key2', 'batch_key1', 'batch_key2')
+        client.send_mux_frame(big_sid_1, 'DEL', 'mux_key1', 'mux_key2', 'batch_key1', 'batch_key2',
+                              'big_sid_key1', 'big_sid_key2', 'big_sid_key3')
         time.sleep(0.5)
         client.recv_mux_frames()
 

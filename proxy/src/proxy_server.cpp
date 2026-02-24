@@ -25,7 +25,8 @@ static void signalHandler(int sig) {
 }
 
 ProxyServer::ProxyServer(Config& config)
-    : config_(config), start_time_(std::chrono::steady_clock::now()) {}
+    : config_(config), hot_upgrade_mgr_(this),
+      start_time_(std::chrono::steady_clock::now()) {}
 
 ProxyServer::~ProxyServer() {
     shutdown();
@@ -78,16 +79,28 @@ bool ProxyServer::init() {
     return true;
 }
 
+void ProxyServer::startWorkers() {
+    if (workers_started_) return;
+    workers_started_ = true;
+    for (auto& worker : workers_) {
+        worker->start();
+    }
+    LOG_INFO("All %zu worker threads started", workers_.size());
+}
+
 void ProxyServer::run() {
     running_ = true;
     g_server = this;
 
-    // Start worker threads
-    for (auto& worker : workers_) {
-        worker->start();
-    }
+    // Start worker threads if not already started (e.g. by hot upgrade)
+    startWorkers();
 
     LOG_INFO("ProxyServer running, entering main event loop");
+
+    // Add a periodic timer to check for pending hot upgrade (every 100ms)
+    main_loop_.addTimer(100, [this]() {
+        checkPendingUpgrade();
+    }, true);
 
     // Run main thread event loop (handles accepts and admin)
     main_loop_.run();
@@ -114,20 +127,25 @@ void ProxyServer::shutdown() {
     }
 
     // Phase 2: Wait for existing connections to drain (with timeout)
-    uint32_t timeout_secs = config_.getShutdownTimeout();
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
+    // Skip if hot upgrade completed (connections already transferred)
+    if (hot_upgrade_mgr_.getState() == UpgradeState::COMPLETED) {
+        LOG_INFO("Hot upgrade complete, skipping connection drain wait");
+    } else {
+        uint32_t timeout_secs = config_.getShutdownTimeout();
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        size_t total_conns = 0;
-        for (const auto& worker : workers_) {
-            total_conns += worker->getConnectionCount();
+        while (std::chrono::steady_clock::now() < deadline) {
+            size_t total_conns = 0;
+            for (const auto& worker : workers_) {
+                total_conns += worker->getConnectionCount();
+            }
+            if (total_conns == 0) {
+                LOG_INFO("All connections drained");
+                break;
+            }
+            LOG_INFO("Waiting for %zu connections to drain (timeout=%us)...", total_conns, timeout_secs);
+            usleep(500000); // 500ms
         }
-        if (total_conns == 0) {
-            LOG_INFO("All connections drained");
-            break;
-        }
-        LOG_INFO("Waiting for %zu connections to drain (timeout=%us)...", total_conns, timeout_secs);
-        usleep(500000); // 500ms
     }
 
     // Phase 3: Force close - stop all workers
@@ -269,6 +287,60 @@ bool ProxyServer::removeBackend(uint16_t listen_port) {
     // Remove from backend manager and config
     backend_mgr_.removeBackend(listen_port);
     config_.removeBackend(listen_port);
+    return true;
+}
+
+void ProxyServer::triggerHotUpgrade() {
+    upgrade_pending_.store(true);
+    main_loop_.wakeup();
+}
+
+void ProxyServer::checkPendingUpgrade() {
+    if (upgrade_pending_.exchange(false)) {
+        LOG_INFO("Processing pending hot upgrade request");
+        hot_upgrade_mgr_.startUpgrade("");
+    }
+}
+
+bool ProxyServer::addWorkers(int count) {
+    if (count <= 0) return false;
+
+    bool mux_enabled = config_.getMuxConfig().enabled;
+    uint32_t max_streams = config_.getMuxConfig().max_streams_per_connection;
+    int current_size = static_cast<int>(workers_.size());
+
+    for (int i = 0; i < count; i++) {
+        int new_id = current_size + i;
+        auto worker = std::make_unique<WorkerThread>(new_id, &backend_mgr_, mux_enabled, max_streams);
+        worker->start();
+        workers_.push_back(std::move(worker));
+        LOG_INFO("Added worker %d (total: %zu)", new_id, workers_.size());
+    }
+
+    return true;
+}
+
+bool ProxyServer::removeWorkers(int count) {
+    if (count <= 0) return false;
+
+    int current_size = static_cast<int>(workers_.size());
+    if (count >= current_size) {
+        LOG_ERROR("Cannot remove %d workers, only %d exist (must keep at least 1)", count, current_size);
+        return false;
+    }
+
+    // Remove workers from the end
+    for (int i = 0; i < count; i++) {
+        int idx = static_cast<int>(workers_.size()) - 1;
+        LOG_INFO("Removing worker %d (stopping...)", workers_[idx]->getId());
+
+        // Migrate connections from the removed worker to remaining workers
+        // For simplicity, we just stop the worker (clients will reconnect)
+        workers_[idx]->stop();
+        workers_.pop_back();
+        LOG_INFO("Worker removed (remaining: %zu)", workers_.size());
+    }
+
     return true;
 }
 
