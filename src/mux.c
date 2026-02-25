@@ -186,8 +186,12 @@ static client *muxCreateVirtualClient(muxStream *ms) {
     if (owner->user) vc->user = owner->user;
     vc->authenticated = owner->authenticated;
 
-    /* Select the same DB as the owner */
-    selectDb(vc, owner->db->id);
+    /* Always start virtual clients on DB 0 (the default).
+     * Each stream is an independent logical connection, so it should
+     * not silently inherit the owner's DB which may have been changed
+     * by a SELECT before HELLO MULTIPLEX. Clients that need a different
+     * DB should explicitly issue SELECT on their stream. */
+    selectDb(vc, 0);
 
     /* Link the virtual client to server.clients and clients_index.
      * This ensures that features like CLIENT TRACKING, CLIENT LIST,
