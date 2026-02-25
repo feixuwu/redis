@@ -80,6 +80,7 @@ set ::ignoredigest 0
 set ::large_memory 0
 set ::log_req_res 0
 set ::force_resp3 0
+set ::mux 0
 
 # Set to 1 when we are running in client mode. The Redis test uses a
 # server-client model to run tests simultaneously. The server instance
@@ -174,6 +175,15 @@ proc reconnect {args} {
     }
     dict set srv "client" $client
 
+    # Enable MUX mode if --mux flag is set
+    if {$::mux} {
+        if {[dict exists $config "requirepass"]} {
+            $client enable_mux 1 [dict get $config "requirepass"]
+        } else {
+            $client enable_mux
+        }
+    }
+
     # select the right db when we don't have to authenticate
     if {![dict exists $config "requirepass"] && !$::singledb} {
         $client select 9
@@ -192,6 +202,16 @@ proc redis_deferring_client {args} {
 
     # create client that defers reading reply
     set client [redis [srv $level "host"] [srv $level "port"] 1 $::tls]
+
+    # Enable MUX mode before SELECT if --mux flag is set
+    if {$::mux} {
+        set _config [srv $level "config"]
+        if {[dict exists $_config "requirepass"]} {
+            $client enable_mux 1 [dict get $_config "requirepass"]
+        } else {
+            $client enable_mux
+        }
+    }
 
     # select the right db and read the response (OK)
     if {!$::singledb} {
@@ -214,6 +234,16 @@ proc redis_client {args} {
 
     # create client that won't defers reading reply
     set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls]
+
+    # Enable MUX mode if --mux flag is set
+    if {$::mux} {
+        set _config [srv $level "config"]
+        if {[dict exists $_config "requirepass"]} {
+            $client enable_mux 1 [dict get $_config "requirepass"]
+        } else {
+            $client enable_mux
+        }
+    }
 
     # select the right db and read the response (OK), or at least ping
     # the server if we're in a singledb mode.
@@ -573,6 +603,7 @@ proc print_help_screen {} {
         "--ignore-encoding  Don't validate object encoding."
         "--ignore-digest    Don't use debug digest validations."
         "--large-memory     Run tests using over 100mb."
+        "--mux              Run tests with MUX (stream-multiplexed) connections."
         "--help             Print this help screen."
     } "\n"]
 }
@@ -698,6 +729,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::singledb 1
     } elseif {$opt eq {--large-memory}} {
         set ::large_memory 1
+    } elseif {$opt eq {--mux}} {
+        set ::mux 1
     } elseif {$opt eq {--ignore-encoding}} {
         set ::ignoreencoding 1
     } elseif {$opt eq {--ignore-digest}} {

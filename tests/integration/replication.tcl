@@ -394,7 +394,7 @@ foreach mdl {no yes} {
     }
 }
 
-start_server {tags {"repl external:skip"} overrides {save {}}} {
+start_server {tags {"repl external:skip mux:skip"} overrides {save {}}} {
     set master [srv 0 client]
     set master_host [srv 0 host]
     set master_port [srv 0 port]

@@ -72,9 +72,8 @@ start_server {tags {"keyspace"}} {
     } {10}
 
     test {Commands pipelining} {
-        set fd [r channel]
-        puts -nonewline $fd "SET k1 xyzk\r\nGET k1\r\nPING\r\n"
-        flush $fd
+        r write "SET k1 xyzk\r\nGET k1\r\nPING\r\n"
+        r flush
         set res {}
         append res [string match OK* [r read]]
         append res [r read]

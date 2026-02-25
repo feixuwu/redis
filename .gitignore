@@ -42,3 +42,4 @@ Makefile.dep
 compile_commands.json
 redis.code-workspace
 build_asan
+.rediscli_history_test

@@ -241,6 +241,11 @@ proc tags_acceptable {tags err_return} {
         return 0
     }
 
+    if {$::mux && [lsearch $tags "mux:skip"] >= 0} {
+        set err "Not supported in mux mode"
+        return 0
+    }
+
     return 1
 }
 
@@ -349,6 +354,9 @@ proc run_external_server_test {code overrides} {
     dict set srv "port" $::port
     set client [redis $::host $::port 0 $::tls]
     dict set srv "client" $client
+    if {$::mux} {
+        $client enable_mux
+    }
     if {!$::singledb} {
         $client select 9
     }

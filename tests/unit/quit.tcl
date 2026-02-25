@@ -1,4 +1,4 @@
-start_server {tags {"quit"}} {
+start_server {tags {"quit" "mux:skip"}} {
 
     test "QUIT returns OK" {
         reconnect

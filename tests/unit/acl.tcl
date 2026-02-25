@@ -908,7 +908,7 @@ start_server {tags {"acl external:skip"}} {
         # The client is closed
         catch {[r ping]} e
         assert_match "*I/O error*" $e
-    }
+    } {} {mux:skip}
 
     test {ACL GENPASS command failed test} {
        catch {r ACL genpass -236} err1

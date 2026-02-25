@@ -219,7 +219,7 @@ start_server {tags {"other"}} {
         r config set appendonly no
     } {OK} {needs:debug}
 
-    tags {protocol} {
+    tags {protocol mux:skip} {
         test {PIPELINING stresser (also a regression for the old epoll bug)} {
             if {$::tls} {
                 set fd2 [::tls::socket [srv host] [srv port]]

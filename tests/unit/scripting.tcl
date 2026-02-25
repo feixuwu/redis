@@ -1115,7 +1115,7 @@ start_server {tags {"scripting"}} {
 
 # Start a new server since the last test in this stanza will kill the
 # instance at all.
-start_server {tags {"scripting"}} {
+start_server {tags {"scripting mux:skip"}} {
     test {Timedout read-only scripts can be killed by SCRIPT KILL} {
         set rd [redis_deferring_client]
         r config set lua-time-limit 10
@@ -2186,7 +2186,7 @@ start_server {tags {"scripting"}} {
         }
         r config set min-replicas-to-write 0
         r config set lua-time-limit 5000
-    } {OK} {external:skip needs:repl}
+    } {OK} {external:skip needs:repl mux:skip}
 
     test "allow-stale shebang flag" {
         r config set replica-serve-stale-data no

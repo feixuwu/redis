@@ -6,8 +6,16 @@ start_server {tags {"introspection"}} {
     }
 
     test {CLIENT LIST} {
-        r client list
-    } {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|list user=* redir=-1 resp=*}
+        set cl [r client list]
+        if {$::mux} {
+            # In MUX mode, CLIENT LIST returns both the MUX owner (flags=N) and
+            # the MUX stream virtual client (flags=m). We verify the stream line.
+            assert_match {*flags=N*mux-streams=*} $cl
+            assert_match {*flags=m*mux-sid=*mux-owner=*} $cl
+        } else {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|list user=* redir=-1 resp=*} $cl
+        }
+    }
 
     test {CLIENT LIST with IDs} {
         set myid [r client id]
@@ -16,8 +24,15 @@ start_server {tags {"introspection"}} {
     }
 
     test {CLIENT INFO} {
-        r client info
-    } {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|info user=* redir=-1 resp=*}
+        set ci [r client info]
+        if {$::mux} {
+            # In MUX mode, CLIENT INFO returns info of the MUX stream (flags=m, fd=-1).
+            # Field order: id=* ... fd=-1 ... flags=m ... cmd=client|info ... mux-sid=* mux-owner=*
+            assert_match {*fd=-1*flags=m*cmd=client|info*mux-sid=*mux-owner=*} $ci
+        } else {
+            assert_match {id=* addr=*:* laddr=*:* fd=* name=* age=* idle=* flags=N db=* sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=26 qbuf-free=* argv-mem=* multi-mem=0 rbs=* rbp=* obl=0 oll=0 omem=0 tot-mem=* events=r cmd=client|info user=* redir=-1 resp=*} $ci
+        }
+    }
 
     test {CLIENT KILL with illegal arguments} {
         assert_error "ERR wrong number of arguments for 'client|kill' command" {r client kill}
@@ -103,7 +118,7 @@ start_server {tags {"introspection"}} {
         $rd2 close
         $rd3 close
         $rd4 close
-    }
+    } {} {mux:skip}
 
     test {CLIENT command unhappy path coverage} {
         assert_error "ERR*wrong number of arguments*" {r client caching}
@@ -159,7 +174,7 @@ start_server {tags {"introspection"}} {
         } else {
             fail "bgsave did not stop in time"
         }
-    } {} {needs:save}
+    } {} {needs:save mux:skip}
 
     test "CLIENT REPLY OFF/ON: disable all commands reply" {
         set rd [redis_deferring_client]
@@ -840,7 +855,7 @@ start_server {config "minimal.conf" tags {"introspection external:skip"} overrid
             assert_error "ERR *protected*" {$r2 config set dir somedir}
             assert_error "ERR *DEBUG command not allowed*" {$r2 DEBUG HELP}
         }
-    } {} {needs:debug}
+    } {} {needs:debug mux:skip}
 }
 
 test {config during loading} {
@@ -868,7 +883,7 @@ test {config during loading} {
         # no need to keep waiting for loading to complete
         exec kill [srv 0 pid]
     }
-} {} {external:skip}
+} {} {external:skip mux:skip}
 
 test {CONFIG REWRITE handles rename-command properly} {
     start_server {tags {"introspection"} overrides {rename-command {flushdb badger}}} {
