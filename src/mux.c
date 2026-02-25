@@ -86,6 +86,7 @@ int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint64_t *str
 
 void muxInit(void) {
     server.mux_connections_with_pending_writes = listCreate();
+    server.mux_virtual_client_count = 0;
 }
 
 /* ========================== Connection Management ========================== */
@@ -145,6 +146,7 @@ void muxConnectionFree(muxConnection *mux) {
             ms->virtual_client = NULL;
             vc->mux_data = NULL;
             vc->flags &= ~CLIENT_MUX_VIRTUAL;
+            server.mux_virtual_client_count--;
             freeClient(vc);
         }
         /* Don't call muxStreamFree() here as it would dictDelete()
@@ -187,11 +189,12 @@ static client *muxCreateVirtualClient(muxStream *ms) {
     /* Select the same DB as the owner */
     selectDb(vc, owner->db->id);
 
-    /* NOTE: We intentionally do NOT call linkClient(vc) here.
-     * Virtual clients are managed entirely by the mux connection and
-     * should not appear in server.clients to avoid interference with
-     * clientsCron, client eviction, and other per-client processing.
-     * They can still be enumerated via the mux connection's streams dict. */
+    /* Link the virtual client to server.clients and clients_index.
+     * This ensures that features like CLIENT TRACKING, CLIENT LIST,
+     * CLIENT KILL, lookupClientByID(), etc. work correctly for virtual clients.
+     * clientsCron() will skip virtual clients via the CLIENT_MUX_VIRTUAL flag. */
+    linkClient(vc);
+    server.mux_virtual_client_count++;
 
     return vc;
 }
@@ -292,6 +295,7 @@ static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint64_t stream_id
             if (ms->virtual_client) {
                 ms->virtual_client->mux_data = NULL;
                 ms->virtual_client->flags &= ~CLIENT_MUX_VIRTUAL;
+                server.mux_virtual_client_count--;
                 freeClient(ms->virtual_client);
                 ms->virtual_client = NULL;
             }
@@ -399,6 +403,7 @@ static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint64_t stream_id
             if (ms->virtual_client) {
                 ms->virtual_client->mux_data = NULL;
                 ms->virtual_client->flags &= ~CLIENT_MUX_VIRTUAL;
+                server.mux_virtual_client_count--;
                 freeClient(ms->virtual_client);
                 ms->virtual_client = NULL;
             }

@@ -5661,7 +5661,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "clients_in_timeout_table:%llu\r\n", (unsigned long long) raxSize(server.clients_timeout_table),
             "total_watched_keys:%lu\r\n", watched_keys,
             "total_blocking_keys:%lu\r\n", blocking_keys,
-            "total_blocking_keys_on_nokey:%lu\r\n", blocking_keys_on_nokey));
+            "total_blocking_keys_on_nokey:%lu\r\n", blocking_keys_on_nokey,
+            "mux_virtual_clients:%d\r\n", server.mux_virtual_client_count));
     }
 
     /* Memory */

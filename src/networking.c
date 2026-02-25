@@ -1462,18 +1462,19 @@ void unlinkClient(client *c) {
     /* If this is marked as current client unset it. */
     if (c->conn && server.current_client == c) server.current_client = NULL;
 
+    /* Remove from the list of active clients (server.clients and clients_index).
+     * This applies to both regular clients and MUX virtual clients. */
+    if (c->client_list_node) {
+        uint64_t id = htonu64(c->id);
+        raxRemove(server.clients_index,(unsigned char*)&id,sizeof(id),NULL);
+        listDelNode(server.clients,c->client_list_node);
+        c->client_list_node = NULL;
+    }
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
     if (c->conn) {
-        /* Remove from the list of active clients. */
-        if (c->client_list_node) {
-            uint64_t id = htonu64(c->id);
-            raxRemove(server.clients_index,(unsigned char*)&id,sizeof(id),NULL);
-            listDelNode(server.clients,c->client_list_node);
-            c->client_list_node = NULL;
-        }
-
         /* Check if this is a replica waiting for diskless replication (rdb pipe),
          * in which case it needs to be cleaned from that list */
         if (c->flags & CLIENT_SLAVE &&
@@ -1738,6 +1739,7 @@ void freeClient(client *c) {
         if (c->flags & CLIENT_MUX_VIRTUAL) {
             /* Virtual client: mux_data points to muxStream.
              * The muxStream itself is freed by muxStreamFree(). */
+            server.mux_virtual_client_count--;
             c->mux_data = NULL;
         } else {
             /* Owner client: mux_data points to muxConnection.

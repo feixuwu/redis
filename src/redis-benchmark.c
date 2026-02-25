@@ -121,6 +121,7 @@ static struct config {
     int resp3; /* use RESP3 */
     int mux_mode;         /* Enable MUX (stream-multiplexed) mode */
     int mux_streams;      /* Number of MUX streams per connection */
+    muxSharedConn *single_thread_mux; /* Single-threaded MUX shared conn (reset between tests) */
 } config;
 
 typedef struct _client {
@@ -1266,12 +1267,11 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
             mc = thread->mux_conn;
         }
         /* For thread_id < 0 (single-threaded mode), we store the mux conn
-         * in a static variable that we create on first call */
-        static muxSharedConn *s_single_thread_mux = NULL;
+         * in a file-level static so it can be reset between benchmark runs. */
         if (thread_id < 0) {
-            if (!s_single_thread_mux)
-                s_single_thread_mux = muxSharedConnCreate(-1);
-            mc = s_single_thread_mux;
+            if (!config.single_thread_mux)
+                config.single_thread_mux = muxSharedConnCreate(-1);
+            mc = config.single_thread_mux;
         }
 
         if (!mc) {
@@ -1721,6 +1721,16 @@ static void benchmark(const char *title, char *cmd, int len) {
 
     showLatencyReport();
     freeAllClients();
+    /* In single-threaded MUX mode, free and reset the shared connection
+     * so that stream IDs start fresh for the next test. Without this,
+     * next_stream_id keeps growing and eventually exceeds the clients[]
+     * array bounds (1024), causing responses to be silently dropped. */
+    if (config.mux_mode && config.single_thread_mux && !config.num_threads) {
+        aeDeleteFileEvent(config.el, config.single_thread_mux->fd, AE_READABLE);
+        aeDeleteFileEvent(config.el, config.single_thread_mux->fd, AE_WRITABLE);
+        muxSharedConnFree(config.single_thread_mux);
+        config.single_thread_mux = NULL;
+    }
     if (config.threads) freeBenchmarkThreads();
     if (config.current_sec_latency_histogram) hdr_close(config.current_sec_latency_histogram);
     if (config.latency_histogram) hdr_close(config.latency_histogram);
@@ -2504,6 +2514,7 @@ int main(int argc, char **argv) {
     config.resp3 = 0;
     config.mux_mode = 0;
     config.mux_streams = MUX_DEFAULT_STREAMS;
+    config.single_thread_mux = NULL;
 
     i = parseOptions(argc,argv);
     argc -= i;
