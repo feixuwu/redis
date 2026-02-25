@@ -140,11 +140,15 @@ int muxDecodeFrameHeader(const unsigned char *buf, uint8_t *flags, uint64_t *str
 void muxSendPong(muxConnection *mux);
 void muxSendGoaway(muxConnection *mux, uint64_t last_stream_id, uint32_t error_code);
 void muxSendStreamError(muxConnection *mux, uint64_t stream_id, const char *errmsg);
+void muxSendStreamClose(muxConnection *mux, uint64_t stream_id);
 
 /* Put a mux connection into the pending write queue */
 void muxPutInPendingWriteQueue(muxConnection *mux);
 
 /* Client integration - called from networking.c */
 int muxPrepareVirtualClientToWrite(client *c);
+
+/* Virtual client lifecycle - close stream when virtual client is freed */
+void muxCloseVirtualClientStream(client *vc);
 
 #endif /* __MUX_H */

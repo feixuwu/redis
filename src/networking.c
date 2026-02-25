@@ -1738,8 +1738,10 @@ void freeClient(client *c) {
     if (c->mux_data) {
         if (c->flags & CLIENT_MUX_VIRTUAL) {
             /* Virtual client: mux_data points to muxStream.
-             * The muxStream itself is freed by muxStreamFree(). */
-            server.mux_virtual_client_count--;
+             * Clean up the stream and send STREAM_CLOSE to the peer.
+             * muxCloseVirtualClientStream() will also free the muxStream
+             * and remove it from the mux connection's streams dict. */
+            muxCloseVirtualClientStream(c);
             c->mux_data = NULL;
         } else {
             /* Owner client: mux_data points to muxConnection.
@@ -4049,6 +4051,25 @@ int checkClientOutputBufferLimits(client *c) {
  *
  * Returns 1 if client was (flagged) closed. */
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
+    /* For MUX virtual clients (conn=NULL), we cannot free them directly here
+     * since we are in an addReply context. Instead, mark them with
+     * CLIENT_CLOSE_ASAP so that muxFlushPendingWrites() will close the
+     * stream after flushing remaining replies. */
+    if (c->flags & CLIENT_MUX_VIRTUAL) {
+        serverAssert(c->reply_bytes < SIZE_MAX-(1024*64));
+        if (c->reply_bytes == 0 || c->flags & CLIENT_CLOSE_ASAP) return 0;
+        if (checkClientOutputBufferLimits(c)) {
+            sds client_info = catClientInfoString(sdsempty(),c);
+            c->flags |= CLIENT_CLOSE_ASAP;
+            serverLog(LL_WARNING,
+                      "MUX virtual client %s scheduled to be closed for overcoming of output buffer limits.",
+                      client_info);
+            sdsfree(client_info);
+            server.stat_client_outbuf_limit_disconnections++;
+            return 1;
+        }
+        return 0;
+    }
     if (!c->conn) return 0; /* It is unsafe to free fake clients. */
     serverAssert(c->reply_bytes < SIZE_MAX-(1024*64));
     /* Note that c->reply_bytes is irrelevant for replica clients

@@ -1030,9 +1030,14 @@ void clientsCron(void) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
 
-        /* Skip MUX virtual clients - they have no physical connection
-         * and are managed by their owner (mux) client. */
-        if (c->flags & CLIENT_MUX_VIRTUAL) continue;
+        /* MUX virtual clients have no physical connection and most cron
+         * checks (buffer resize, output limit, memory tracking) don't apply.
+         * However, we still need idle timeout checks to prevent stream
+         * resource leaks when clients abandon streams without closing them. */
+        if (c->flags & CLIENT_MUX_VIRTUAL) {
+            if (clientsCronHandleTimeout(c,now)) continue;
+            continue;
+        }
 
         /* The following functions do different service checks on the client.
          * The protocol is that they return non-zero if the client was

@@ -601,6 +601,34 @@ static void muxWriteHandler(connection *conn) {
     }
 }
 
+/* Send a STREAM_CLOSE frame on the given stream. */
+void muxSendStreamClose(muxConnection *mux, uint64_t stream_id) {
+    unsigned char header[MUX_FRAME_HEADER_SIZE];
+    muxEncodeFrameHeader(header, MUX_FRAME_STREAM_CLOSE, stream_id, 0);
+    mux->write_batch_buf = sdscatlen(mux->write_batch_buf, header, MUX_FRAME_HEADER_SIZE);
+}
+
+/* Close a virtual client's stream. Called from freeClient() when a virtual
+ * client is being freed (e.g. CLIENT KILL) to ensure the muxStream is also
+ * cleaned up and a STREAM_CLOSE frame is sent to the peer. */
+void muxCloseVirtualClientStream(client *vc) {
+    if (!vc->mux_data) return;
+    muxStream *ms = (muxStream *)vc->mux_data;
+    muxConnection *mux = ms->mux_conn;
+
+    /* Send STREAM_CLOSE frame to notify the peer */
+    if (mux) {
+        muxSendStreamClose(mux, ms->stream_id);
+        muxPutInPendingWriteQueue(mux);
+    }
+
+    /* Detach virtual client from the stream */
+    ms->virtual_client = NULL;
+
+    /* Free the stream itself */
+    muxStreamFree(ms);
+}
+
 /* Flush all pending mux writes. Called from beforeSleep().
  * This iterates all mux connections that have pending virtual client replies,
  * frames them, and writes them out in a single batch per connection. */
@@ -623,6 +651,23 @@ void muxFlushPendingWrites(void) {
             client *vc = ms->virtual_client;
             if (vc && clientHasPendingReplies(vc)) {
                 muxFrameReply(mux, ms, vc);
+            }
+            /* After flushing replies, check if the virtual client needs to be
+             * closed (e.g. QUIT command sets CLIENT_CLOSE_AFTER_REPLY, or
+             * output buffer limit triggers CLIENT_CLOSE_ASAP). In normal
+             * (non-mux) mode this is handled by writeToClient(), but virtual
+             * clients never go through that path. */
+            if (vc && (vc->flags & (CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP)) &&
+                !clientHasPendingReplies(vc)) {
+                /* Send STREAM_CLOSE frame to notify the peer */
+                muxSendStreamClose(mux, ms->stream_id);
+                /* Detach and free the virtual client and stream */
+                ms->virtual_client = NULL;
+                vc->mux_data = NULL;
+                vc->flags &= ~CLIENT_MUX_VIRTUAL;
+                server.mux_virtual_client_count--;
+                freeClient(vc);
+                muxStreamFree(ms);
             }
         }
         dictReleaseIterator(di);
