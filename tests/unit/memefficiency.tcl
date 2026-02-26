@@ -605,13 +605,17 @@ run_solo {defrag} {
             # add a mass of list nodes to two lists (allocations are interlaced)
             set val [string repeat A 100] ;# 5 items of 100 bytes puts us in the 640 bytes bin, which has 32 regs, so high potential for fragmentation
             set elements 500000
-            for {set j 0} {$j < $elements} {incr j} {
-                $rd lpush biglist1 $val
-                $rd lpush biglist2 $val
-            }
-            for {set j 0} {$j < $elements} {incr j} {
-                $rd read ; # Discard replies
-                $rd read ; # Discard replies
+            set chunk 100000
+            for {set base 0} {$base < $elements} {incr base $chunk} {
+                set stop [expr {$base + $chunk}]
+                for {set j $base} {$j < $stop} {incr j} {
+                    $rd lpush biglist1 $val
+                    $rd lpush biglist2 $val
+                }
+                for {set j 0} {$j < $chunk} {incr j} {
+                    $rd read ; # Discard replies
+                    $rd read ; # Discard replies
+                }
             }
 
             # create some fragmentation

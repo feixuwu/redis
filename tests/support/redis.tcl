@@ -365,6 +365,13 @@ proc ::redis::mux_read_frame {fd} {
     binary scan $hdr c magic
     set magic [expr {$magic & 0xFF}]
     if {$magic != 0xAA} {
+        # 打印收到的原始数据以便诊断
+        set hex_hdr {}
+        for {set i 0} {$i < [string length $hdr]} {incr i} {
+            binary scan [string index $hdr $i] cu byte_val
+            append hex_hdr [format "%02x " $byte_val]
+        }
+        puts stderr "MUX_DEBUG mux_read_frame: bad magic! raw header bytes: $hex_hdr"
         error "MUX: bad magic byte 0x[format %02x $magic]"
     }
     binary scan $hdr x1c flags_raw
@@ -402,7 +409,10 @@ proc ::redis::mux_read_resp_data {id fd needed} {
             }
         } elseif {$frame_type == 0x03} {
             # STREAM_CLOSE - server closed the stream
+            puts stderr "MUX_DEBUG STREAM_CLOSE received! id=$id stream_id=$stream_id"
             error "I/O error reading reply"
+        } else {
+            puts stderr "MUX_DEBUG unexpected frame type=0x[format %02x $frame_type] id=$id stream_id=$stream_id"
         }
         # Silently skip PONG (0x05), GOAWAY (0x06), etc.
     }

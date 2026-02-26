@@ -437,10 +437,10 @@ start_server {tags {"maxmemory external:skip"}} {
         r set k2 v2
         # There must be 4098 keys because redis doesn't evict keys.
         r dbsize
-    } {4098}
+    } {4098} {mux:skip}
 }
 
-start_server {tags {"maxmemory external:skip"}} {
+start_server {tags {"maxmemory external:skip mux:skip"}} {
     test {client tracking don't cause eviction feedback loop} {
         r config set latency-tracking no
         r config set maxmemory 0

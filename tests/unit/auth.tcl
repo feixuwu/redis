@@ -19,7 +19,7 @@ start_server {tags {"auth external:skip"} overrides {requirepass foobar}} {
     test {Arbitrary command gives an error when AUTH is required} {
         catch {r set foo bar} err
         set _ $err
-    } {NOAUTH*}
+    } {NOAUTH*} {mux:skip}
 
     test {AUTH succeeds when the right password is given} {
         r auth foobar

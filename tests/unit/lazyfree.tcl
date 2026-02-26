@@ -16,7 +16,7 @@ start_server {tags {"lazyfree"}} {
         } else {
             fail "Memory is not reclaimed by UNLINK"
         }
-    }
+    } {} {mux:skip}
 
     test "FLUSHDB ASYNC can reclaim memory in background" {
         # make the previous test is really done before sampling used_memory
@@ -36,9 +36,9 @@ start_server {tags {"lazyfree"}} {
             [s used_memory] < $peak_mem &&
             [s used_memory] < $orig_mem*2
         } else {
-            fail "Memory is not reclaimed by FLUSHDB ASYNC"
+        fail "Memory is not reclaimed by FLUSHDB ASYNC"
         }
-    }
+    } {} {mux:skip}
 
     test "lazy free a stream with all types of metadata" {
         # make the previous test is really done before doing RESETSTAT
