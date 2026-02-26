@@ -751,3 +751,65 @@ void muxSendStreamError(muxConnection *mux, uint64_t stream_id, const char *errm
     mux->write_batch_buf = sdscatlen(mux->write_batch_buf, errmsg, msglen);
     muxPutInPendingWriteQueue(mux);
 }
+
+/* ========================== Mux-aware I/O Helpers ========================== */
+
+/* 获取客户端的底层连接：对于普通客户端返回 c->conn，
+ * 对于 mux 虚拟客户端返回 owner client 的 conn。 */
+connection *muxGetConn(client *c) {
+    if (c->conn) return c->conn;
+    if (c->flags & CLIENT_MUX_VIRTUAL) {
+        muxStream *ms = (muxStream *)c->mux_data;
+        if (ms && ms->mux_conn) return ms->mux_conn->conn;
+    }
+    return NULL;
+}
+
+/* Mux-aware connWrite：对于普通客户端直接调用 connWrite，
+ * 对于 mux 虚拟客户端将数据通过 mux framing 包装后追加到 write_batch_buf。
+ *
+ * 注意：对于 mux 虚拟客户端，写入总是"成功"的（缓冲到 batch buf），
+ * 实际的 socket 写入延迟到 muxFlushPendingWrites() 中完成。 */
+ssize_t muxConnWrite(client *c, const void *data, size_t len) {
+    if (c->conn) {
+        return connWrite(c->conn, data, len);
+    }
+    if (c->flags & CLIENT_MUX_VIRTUAL) {
+        muxStream *ms = (muxStream *)c->mux_data;
+        if (!ms || !ms->mux_conn) return -1;
+        muxConnection *mux = ms->mux_conn;
+
+        /* 构建 MUX DATA frame 并追加到 write_batch_buf */
+        unsigned char header[MUX_FRAME_HEADER_SIZE];
+        muxEncodeFrameHeader(header, MUX_FRAME_DATA, ms->stream_id, (uint32_t)len);
+        mux->write_batch_buf = sdscatlen(mux->write_batch_buf, header, MUX_FRAME_HEADER_SIZE);
+        mux->write_batch_buf = sdscatlen(mux->write_batch_buf, data, len);
+        mux->pending_write_frames++;
+        muxPutInPendingWriteQueue(mux);
+        return (ssize_t)len;
+    }
+    return -1;
+}
+
+/* Mux-aware connSetWriteHandler：对于普通客户端直接调用 connSetWriteHandler，
+ * 对于 mux 虚拟客户端在 owner client 的 conn 上设置写回调。 */
+int muxConnSetWriteHandler(client *c, ConnectionCallbackFunc func) {
+    if (c->conn) {
+        return connSetWriteHandler(c->conn, func);
+    }
+    if (c->flags & CLIENT_MUX_VIRTUAL) {
+        muxStream *ms = (muxStream *)c->mux_data;
+        if (!ms || !ms->mux_conn) return C_ERR;
+        /* 对于 mux 虚拟客户端，write handler 设置在 owner 的底层连接上。
+         * 如果 func 为 NULL 表示清除 handler，直接操作底层 conn。 */
+        return connSetWriteHandler(ms->mux_conn->conn, func);
+    }
+    return C_ERR;
+}
+
+/* Mux-aware connDisableTcpNoDelay：对于普通客户端直接操作 c->conn，
+ * 对于 mux 虚拟客户端操作 owner 的底层连接。 */
+void muxConnDisableTcpNoDelay(client *c) {
+    connection *conn = muxGetConn(c);
+    if (conn) connDisableTcpNoDelay(conn);
+}

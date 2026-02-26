@@ -15,6 +15,7 @@
 #include "bio.h"
 #include "functions.h"
 #include "connection.h"
+#include "mux.h"
 
 #include <memory.h>
 #include <sys/time.h>
@@ -55,7 +56,7 @@ char *replicationGetSlaveName(client *c) {
     ip[0] = '\0';
     buf[0] = '\0';
     if (c->slave_addr ||
-        connAddrPeerName(c->conn,ip,sizeof(ip),NULL) != -1)
+        connAddrPeerName(muxGetConn(c),ip,sizeof(ip),NULL) != -1)
     {
         char *addr = c->slave_addr ? c->slave_addr : ip;
         if (c->slave_listening_port)
@@ -702,7 +703,7 @@ int replicationSetupSlaveForFullResync(client *slave, long long offset) {
     if (!(slave->flags & CLIENT_PRE_PSYNC)) {
         buflen = snprintf(buf,sizeof(buf),"+FULLRESYNC %s %lld\r\n",
                           server.replid,offset);
-        if (connWrite(slave->conn,buf,buflen) != buflen) {
+        if (muxConnWrite(slave,buf,buflen) != buflen) {
             freeClientAsync(slave);
             return C_ERR;
         }
@@ -783,7 +784,7 @@ int masterTryPartialResynchronization(client *c, long long psync_offset) {
     } else {
         buflen = snprintf(buf,sizeof(buf),"+CONTINUE\r\n");
     }
-    if (connWrite(c->conn,buf,buflen) != buflen) {
+    if (muxConnWrite(c,buf,buflen) != buflen) {
         freeClientAsync(c);
         return C_OK;
     }
@@ -916,6 +917,17 @@ void syncCommand(client *c) {
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
 
+    /* Reject SYNC/PSYNC from mux virtual clients. Replication requires
+     * exclusive use of the underlying TCP connection for streaming RDB
+     * data and the replication stream, which is incompatible with mux
+     * multiplexing. Replicas should connect on a dedicated connection. */
+    if (c->flags & CLIENT_MUX_VIRTUAL) {
+        addReplyError(c,
+            "SYNC and PSYNC are not supported on mux streams. "
+            "Use a dedicated connection for replication.");
+        return;
+    }
+
     /* Check if this is a failover request to a replica with the same replid and
      * become a master if so. */
     if (c->argc > 3 && !strcasecmp(c->argv[0]->ptr,"psync") && 
@@ -1020,7 +1032,7 @@ void syncCommand(client *c) {
      * paths will change the state if we handle the slave differently. */
     c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
     if (server.repl_disable_tcp_nodelay)
-        connDisableTcpNoDelay(c->conn); /* Non critical if it fails. */
+        muxConnDisableTcpNoDelay(c); /* Non critical if it fails. */
     c->repldbfd = -1;
     c->flags |= CLIENT_SLAVE;
     listAddNodeTail(server.slaves,c);
@@ -1382,22 +1394,25 @@ void closeRepldbfd(client *myself) {
     myself->repldbfd = -1;
 }
 
-void sendBulkToSlave(connection *conn) {
-    client *slave = connGetPrivateData(conn);
+/* 核心 RDB 发送逻辑：将 RDB 文件数据发送给指定 slave 客户端。
+ * 此函数可被普通回调 sendBulkToSlave 和 mux 轮询路径共同调用。
+ * 返回 0 表示还有数据要发，1 表示 RDB 发送完成，-1 表示出错（slave 已释放）。 */
+static int sendBulkToSlaveCore(client *slave) {
     char buf[PROTO_IOBUF_LEN];
     ssize_t nwritten, buflen;
+    connection *conn = muxGetConn(slave);
 
     /* Before sending the RDB file, we send the preamble as configured by the
      * replication process. Currently the preamble is just the bulk count of
      * the file in the form "$<length>\r\n". */
     if (slave->replpreamble) {
-        nwritten = connWrite(conn,slave->replpreamble,sdslen(slave->replpreamble));
+        nwritten = muxConnWrite(slave,slave->replpreamble,sdslen(slave->replpreamble));
         if (nwritten == -1) {
             serverLog(LL_WARNING,
                 "Write error sending RDB preamble to replica: %s",
-                connGetLastError(conn));
+                conn ? connGetLastError(conn) : "mux write error");
             freeClient(slave);
-            return;
+            return -1;
         }
         atomicIncr(server.stat_net_repl_output_bytes, nwritten);
         sdsrange(slave->replpreamble,nwritten,-1);
@@ -1406,7 +1421,7 @@ void sendBulkToSlave(connection *conn) {
             slave->replpreamble = NULL;
             /* fall through sending data. */
         } else {
-            return;
+            return 0;
         }
     }
 
@@ -1417,26 +1432,66 @@ void sendBulkToSlave(connection *conn) {
         serverLog(LL_WARNING,"Read error sending DB to replica: %s",
             (buflen == 0) ? "premature EOF" : strerror(errno));
         freeClient(slave);
-        return;
+        return -1;
     }
-    if ((nwritten = connWrite(conn,buf,buflen)) == -1) {
-        if (connGetState(conn) != CONN_STATE_CONNECTED) {
+    if ((nwritten = muxConnWrite(slave,buf,buflen)) == -1) {
+        if (conn && connGetState(conn) != CONN_STATE_CONNECTED) {
             serverLog(LL_WARNING,"Write error sending DB to replica: %s",
                 connGetLastError(conn));
             freeClient(slave);
+            return -1;
         }
-        return;
+        return 0;
     }
     slave->repldboff += nwritten;
     atomicIncr(server.stat_net_repl_output_bytes, nwritten);
     if (slave->repldboff == slave->repldbsize) {
         closeRepldbfd(slave);
-        connSetWriteHandler(slave->conn,NULL);
+        muxConnSetWriteHandler(slave,NULL);
+        return 1; /* RDB 发送完成 */
+    }
+    return 0; /* 还有数据要发 */
+}
+
+void sendBulkToSlave(connection *conn) {
+    client *slave = connGetPrivateData(conn);
+    int ret = sendBulkToSlaveCore(slave);
+    if (ret == 1) {
         if (!replicaPutOnline(slave)) {
             freeClient(slave);
             return;
         }
         replicaStartCommandStream(slave);
+    }
+}
+
+/* 轮询所有处于 SLAVE_STATE_SEND_BULK 状态的 mux 虚拟 slave，
+ * 驱动它们的 RDB 传输。对于普通 slave，RDB 传输由 connSetWriteHandler
+ * 注册的 sendBulkToSlave 回调驱动；但 mux 虚拟 slave 没有自己的连接，
+ * 不能注册独立的 write handler，因此需要在 beforeSleep 中轮询。 */
+void muxDriveSlaveRdbTransfer(void) {
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.slaves, &li);
+    while ((ln = listNext(&li))) {
+        client *slave = ln->value;
+
+        /* 只处理 mux 虚拟客户端 && 处于发送 RDB 状态的 slave */
+        if (!(slave->flags & CLIENT_MUX_VIRTUAL)) continue;
+        if (slave->replstate != SLAVE_STATE_SEND_BULK) continue;
+
+        int ret = sendBulkToSlaveCore(slave);
+        if (ret == 1) {
+            /* RDB 发送完成 */
+            if (!replicaPutOnline(slave)) {
+                freeClient(slave);
+                continue;
+            }
+            replicaStartCommandStream(slave);
+        }
+        /* ret == 0: 还有数据要发, 下一轮 beforeSleep 继续 */
+        /* ret == -1: 出错, slave 已在 sendBulkToSlaveCore 内被释放 */
     }
 }
 
@@ -1599,7 +1654,7 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
         client *slave = ln->value;
 
         /* We can get here via freeClient()->killRDBChild()->checkChildrenDone(). skip disconnected slaves. */
-        if (!slave->conn) continue;
+        if (!slave->conn && !(slave->flags & CLIENT_MUX_VIRTUAL)) continue;
 
         if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END) {
             struct redis_stat buf;
@@ -1662,10 +1717,16 @@ void updateSlavesWaitingBgsave(int bgsaveerr, int type) {
                 slave->replpreamble = sdscatprintf(sdsempty(),"$%lld\r\n",
                     (unsigned long long) slave->repldbsize);
 
-                connSetWriteHandler(slave->conn,NULL);
-                if (connSetWriteHandler(slave->conn,sendBulkToSlave) == C_ERR) {
-                    freeClientAsync(slave);
-                    continue;
+                if (slave->flags & CLIENT_MUX_VIRTUAL) {
+                    /* mux 虚拟客户端不能通过 connSetWriteHandler 注册回调，
+                     * RDB 传输将在 muxFlushPendingWrites 中以轮询方式驱动。
+                     * 这里只需设置状态即可。 */
+                } else {
+                    connSetWriteHandler(slave->conn,NULL);
+                    if (connSetWriteHandler(slave->conn,sendBulkToSlave) == C_ERR) {
+                        freeClientAsync(slave);
+                        continue;
+                    }
                 }
             }
         }
@@ -3212,7 +3273,7 @@ void roleCommand(client *c) {
             char ip[NET_IP_STR_LEN], *slaveaddr = slave->slave_addr;
 
             if (!slaveaddr) {
-                if (connAddrPeerName(slave->conn,ip,sizeof(ip),NULL) == -1)
+                if (connAddrPeerName(muxGetConn(slave),ip,sizeof(ip),NULL) == -1)
                     continue;
                 slaveaddr = ip;
             }
@@ -3801,7 +3862,7 @@ void replicationCron(void) {
              server.rdb_child_type != RDB_CHILD_TYPE_SOCKET));
 
         if (is_presync) {
-            connWrite(slave->conn, "\n", 1);
+            muxConnWrite(slave, "\n", 1);
         }
     }
 
@@ -3974,7 +4035,7 @@ static client *findReplica(char *host, int port) {
         char ip[NET_IP_STR_LEN], *replicaip = replica->slave_addr;
 
         if (!replicaip) {
-            if (connAddrPeerName(replica->conn, ip, sizeof(ip), NULL) == -1)
+            if (connAddrPeerName(muxGetConn(replica), ip, sizeof(ip), NULL) == -1)
                 continue;
             replicaip = ip;
         }
@@ -4205,7 +4266,7 @@ void updateFailoverStatus(void) {
                 char ip[NET_IP_STR_LEN], *replicaaddr = replica->slave_addr;
 
                 if (!replicaaddr) {
-                    if (connAddrPeerName(replica->conn,ip,sizeof(ip),NULL) == -1)
+                    if (connAddrPeerName(muxGetConn(replica),ip,sizeof(ip),NULL) == -1)
                         continue;
                     replicaaddr = ip;
                 }

@@ -151,4 +151,12 @@ int muxPrepareVirtualClientToWrite(client *c);
 /* Virtual client lifecycle - close stream when virtual client is freed */
 void muxCloseVirtualClientStream(client *vc);
 
+/* Mux-aware I/O helpers for replication.
+ * These functions transparently handle both normal clients (with conn != NULL)
+ * and mux virtual clients (conn == NULL, data goes through mux framing). */
+ssize_t muxConnWrite(client *c, const void *data, size_t len);
+int muxConnSetWriteHandler(client *c, ConnectionCallbackFunc func);
+void muxConnDisableTcpNoDelay(client *c);
+connection *muxGetConn(client *c);
+
 #endif /* __MUX_H */

@@ -213,6 +213,11 @@ client *createClient(connection *conn) {
 }
 
 void installClientWriteHandler(client *c) {
+    /* mux 虚拟客户端没有自己的 conn，数据通过 mux framing 发送，
+     * 不需要安装独立的 write handler，下一轮 beforeSleep 中
+     * muxFlushPendingWrites 会处理它。 */
+    if (c->flags & CLIENT_MUX_VIRTUAL) return;
+
     int ae_barrier = 0;
     /* For the fsync=always policy, we want that a given FD is never
      * served for reading and writing in the same event loop iteration,
@@ -1949,7 +1954,7 @@ int _writeToClient(client *c, ssize_t *nwritten) {
         serverAssert(o->used >= c->ref_block_pos);
         /* Send current block if it is not fully sent. */
         if (o->used > c->ref_block_pos) {
-            *nwritten = connWrite(c->conn, o->buf+c->ref_block_pos,
+            *nwritten = muxConnWrite(c, o->buf+c->ref_block_pos,
                                   o->used-c->ref_block_pos);
             if (*nwritten <= 0) return C_ERR;
             c->ref_block_pos += *nwritten;
@@ -2036,9 +2041,14 @@ int writeToClient(client *c, int handler_installed) {
     }
 
     if (nwritten == -1) {
-        if (connGetState(c->conn) != CONN_STATE_CONNECTED) {
+        connection *wconn = muxGetConn(c);
+        if (wconn && connGetState(wconn) != CONN_STATE_CONNECTED) {
             serverLog(LL_VERBOSE,
-                "Error writing to client: %s", connGetLastError(c->conn));
+                "Error writing to client: %s", connGetLastError(wconn));
+            freeClientAsync(c);
+            return C_ERR;
+        } else if (!wconn) {
+            /* mux 虚拟客户端底层连接已断开 */
             freeClientAsync(c);
             return C_ERR;
         }
@@ -2058,7 +2068,7 @@ int writeToClient(client *c, int handler_installed) {
          * so we are fine. */
         if (handler_installed) {
             serverAssert(io_threads_op == IO_THREADS_OP_IDLE);
-            connSetWriteHandler(c->conn, NULL);
+            muxConnSetWriteHandler(c, NULL);
         }
 
         /* Close connection after entire reply has been sent. */

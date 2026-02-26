@@ -1665,6 +1665,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         processed += connTypeProcessPendingData();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE)
             flushAppendOnlyFile(0);
+        muxDriveSlaveRdbTransfer(); /* Drive RDB transfer for mux virtual slaves */
         muxFlushPendingWrites(); /* Flush MUX framed replies before regular writes */
         processed += handleClientsWithPendingWrites();
         processed += freeClientsInAsyncFreeQueue();
@@ -1768,6 +1769,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* Handle writes with pending output buffers. */
+    muxDriveSlaveRdbTransfer(); /* Drive RDB transfer for mux virtual slaves */
     muxFlushPendingWrites(); /* Flush MUX framed replies before regular writes */
     handleClientsWithPendingWritesUsingThreads();
 
