@@ -627,6 +627,25 @@ proc ::redis::mux_buf_read {id fd len} {
     return $data
 }
 
+# Read a line (terminated by \n, with optional \r stripped) from MUX RESP buffer.
+# This mimics Tcl's [gets] behavior for readraw mode, where lines are
+# delimited by \n (not \r\n). Needed because bulk string payloads may
+# contain bare \n inside the data (e.g. verbatim strings).
+proc ::redis::mux_buf_gets_lf {id fd} {
+    while {1} {
+        set idx [string first "\n" $::redis::mux_resp_buf($id)]
+        if {$idx >= 0} {
+            set line [string range $::redis::mux_resp_buf($id) 0 [expr {$idx - 1}]]
+            set ::redis::mux_resp_buf($id) [string range $::redis::mux_resp_buf($id) [expr {$idx + 1}] end]
+            # Strip trailing \r if present (like Tcl gets does)
+            set line [string trimright $line "\r"]
+            return $line
+        }
+        # Need more data
+        mux_read_resp_data $id $fd 1
+    }
+}
+
 # Read a line (terminated by \r\n) from MUX RESP buffer
 proc ::redis::mux_buf_gets {id fd} {
     while {1} {
@@ -656,7 +675,7 @@ proc ::redis::mux_buf_bulk_read {id fd} {
 
 proc ::redis::redis_mux_read_reply_logic {id fd} {
     if {$::redis::readraw($id)} {
-        return [string trim [mux_buf_gets $id $fd]]
+        return [string trim [mux_buf_gets_lf $id $fd]]
     }
     while {1} {
         set type [mux_buf_read $id $fd 1]

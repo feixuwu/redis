@@ -246,7 +246,7 @@ start_server {tags {"scripting"}} {
         r function kill
         after 200 ; # Give some time to Lua to call the hook again...
         assert_equal [r ping] "PONG"
-    } {} {mux:skip}
+    }
 
     test {FUNCTION - test script kill not working on function} {
         set rd [redis_deferring_client]
@@ -261,7 +261,7 @@ start_server {tags {"scripting"}} {
         r function kill
         after 200 ; # Give some time to Lua to call the hook again...
         assert_equal [r ping] "PONG"
-    } {} {mux:skip}
+    }
 
     test {FUNCTION - test function kill not working on eval} {
         set rd [redis_deferring_client]
@@ -275,7 +275,7 @@ start_server {tags {"scripting"}} {
         r script kill
         after 200 ; # Give some time to Lua to call the hook again...
         assert_equal [r ping] "PONG"
-    } {} {mux:skip}
+    }
 
     test {FUNCTION - test function flush} {
         r function load REPLACE [get_function_code lua test test {local a = 1 while true do a = a + 1 end}]
