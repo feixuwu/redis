@@ -3880,7 +3880,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
 
     /* Collect the connections of the replicas we want to transfer
      * the RDB to, which are i WAIT_BGSAVE_START state. */
-    server.rdb_pipe_conns = zmalloc(sizeof(connection *)*listLength(server.slaves));
+    server.rdb_pipe_conns = zmalloc(sizeof(client *)*listLength(server.slaves));
     server.rdb_pipe_numconns = 0;
     server.rdb_pipe_numconns_writing = 0;
     listRewind(server.slaves,&li);
@@ -3890,7 +3890,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
             /* Check slave has the exact requirements */
             if (slave->slave_req != req)
                 continue;
-            server.rdb_pipe_conns[server.rdb_pipe_numconns++] = slave->conn;
+            server.rdb_pipe_conns[server.rdb_pipe_numconns++] = slave;
             replicationSetupSlaveForFullResync(slave,getPsyncInitialOffset());
         }
     }

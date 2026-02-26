@@ -399,8 +399,8 @@ static int muxProcessFrame(muxConnection *mux, uint8_t flags, uint64_t stream_id
 
     case MUX_FRAME_ERROR: {
         /* Stream-level error from client - log and close stream */
-        serverLog(LL_WARNING, "MUX: received error frame on stream %u from client %llu",
-                  stream_id, (unsigned long long)mux->owner_client->id);
+        serverLog(LL_WARNING, "MUX: received error frame on stream %llu from client %llu",
+                  (unsigned long long)stream_id, (unsigned long long)mux->owner_client->id);
         muxStream *ms = muxStreamLookup(mux, stream_id);
         if (ms) {
             ms->state = MUX_STREAM_CLOSED;

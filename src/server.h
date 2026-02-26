@@ -1838,7 +1838,7 @@ struct redisServer {
     int rdb_pipe_read;              /* RDB pipe used to transfer the rdb data */
                                     /* to the parent process in diskless repl. */
     int rdb_child_exit_pipe;        /* Used by the diskless parent allow child exit. */
-    connection **rdb_pipe_conns;    /* Connections which are currently the */
+    client **rdb_pipe_conns;        /* Clients (slaves) which are currently the */
     int rdb_pipe_numconns;          /* target of diskless rdb fork child. */
     int rdb_pipe_numconns_writing;  /* Number of rdb conns with pending writes. */
     char *rdb_pipe_buff;            /* In diskless replication, this buffer holds data */

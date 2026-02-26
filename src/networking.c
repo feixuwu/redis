@@ -1476,25 +1476,28 @@ void unlinkClient(client *c) {
         c->client_list_node = NULL;
     }
 
+    /* Check if this is a replica waiting for diskless replication (rdb pipe),
+     * in which case it needs to be cleaned from that list.
+     * Note: this must be done before the c->conn check below, because mux
+     * virtual clients have c->conn == NULL but may still be in rdb_pipe_conns. */
+    if (c->flags & CLIENT_SLAVE &&
+        c->replstate == SLAVE_STATE_WAIT_BGSAVE_END &&
+        server.rdb_pipe_conns)
+    {
+        int i;
+        for (i=0; i < server.rdb_pipe_numconns; i++) {
+            if (server.rdb_pipe_conns[i] == c) {
+                rdbPipeWriteHandlerConnRemoved(c->conn);
+                server.rdb_pipe_conns[i] = NULL;
+                break;
+            }
+        }
+    }
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
     if (c->conn) {
-        /* Check if this is a replica waiting for diskless replication (rdb pipe),
-         * in which case it needs to be cleaned from that list */
-        if (c->flags & CLIENT_SLAVE &&
-            c->replstate == SLAVE_STATE_WAIT_BGSAVE_END &&
-            server.rdb_pipe_conns)
-        {
-            int i;
-            for (i=0; i < server.rdb_pipe_numconns; i++) {
-                if (server.rdb_pipe_conns[i] == c->conn) {
-                    rdbPipeWriteHandlerConnRemoved(c->conn);
-                    server.rdb_pipe_conns[i] = NULL;
-                    break;
-                }
-            }
-        }
         /* Only use shutdown when the fork is active and we are the parent. */
         if (server.child_type) connShutdown(c->conn);
         connClose(c->conn);

@@ -917,17 +917,6 @@ void syncCommand(client *c) {
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
 
-    /* Reject SYNC/PSYNC from mux virtual clients. Replication requires
-     * exclusive use of the underlying TCP connection for streaming RDB
-     * data and the replication stream, which is incompatible with mux
-     * multiplexing. Replicas should connect on a dedicated connection. */
-    if (c->flags & CLIENT_MUX_VIRTUAL) {
-        addReplyError(c,
-            "SYNC and PSYNC are not supported on mux streams. "
-            "Use a dedicated connection for replication.");
-        return;
-    }
-
     /* Check if this is a failover request to a replica with the same replid and
      * become a master if so. */
     if (c->argc > 3 && !strcasecmp(c->argv[0]->ptr,"psync") && 
@@ -1498,7 +1487,7 @@ void muxDriveSlaveRdbTransfer(void) {
 /* Remove one write handler from the list of connections waiting to be writable
  * during rdb pipe transfer. */
 void rdbPipeWriteHandlerConnRemoved(struct connection *conn) {
-    if (!connHasWriteHandler(conn))
+    if (!conn || !connHasWriteHandler(conn))
         return;
     connSetWriteHandler(conn, NULL);
     client *slave = connGetPrivateData(conn);
@@ -1518,7 +1507,7 @@ void rdbPipeWriteHandler(struct connection *conn) {
     serverAssert(server.rdb_pipe_bufflen>0);
     client *slave = connGetPrivateData(conn);
     ssize_t nwritten;
-    if ((nwritten = connWrite(conn, server.rdb_pipe_buff + slave->repldboff,
+    if ((nwritten = muxConnWrite(slave, server.rdb_pipe_buff + slave->repldboff,
                               server.rdb_pipe_bufflen - slave->repldboff)) == -1)
     {
         if (connGetState(conn) == CONN_STATE_CONNECTED)
@@ -1555,10 +1544,9 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 return;
             serverLog(LL_WARNING,"Diskless rdb transfer, read error sending DB to replicas: %s", strerror(errno));
             for (i=0; i < server.rdb_pipe_numconns; i++) {
-                connection *conn = server.rdb_pipe_conns[i];
-                if (!conn)
+                client *slave = server.rdb_pipe_conns[i];
+                if (!slave)
                     continue;
-                client *slave = connGetPrivateData(conn);
                 freeClient(slave);
                 server.rdb_pipe_conns[i] = NULL;
             }
@@ -1572,8 +1560,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
             for (i=0; i < server.rdb_pipe_numconns; i++)
             {
-                connection *conn = server.rdb_pipe_conns[i];
-                if (!conn)
+                if (!server.rdb_pipe_conns[i])
                     continue;
                 stillUp++;
             }
@@ -1590,13 +1577,13 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
         for (i=0; i < server.rdb_pipe_numconns; i++)
         {
             ssize_t nwritten;
-            connection *conn = server.rdb_pipe_conns[i];
-            if (!conn)
+            client *slave = server.rdb_pipe_conns[i];
+            if (!slave)
                 continue;
 
-            client *slave = connGetPrivateData(conn);
-            if ((nwritten = connWrite(conn, server.rdb_pipe_buff, server.rdb_pipe_bufflen)) == -1) {
-                if (connGetState(conn) != CONN_STATE_CONNECTED) {
+            if ((nwritten = muxConnWrite(slave, server.rdb_pipe_buff, server.rdb_pipe_bufflen)) == -1) {
+                connection *conn = muxGetConn(slave);
+                if (conn && connGetState(conn) != CONN_STATE_CONNECTED) {
                     serverLog(LL_WARNING,"Diskless rdb transfer, write error sending DB to replica: %s",
                         connGetLastError(conn));
                     freeClient(slave);
@@ -1616,7 +1603,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             if (nwritten != server.rdb_pipe_bufflen) {
                 slave->repl_last_partial_write = server.unixtime;
                 server.rdb_pipe_numconns_writing++;
-                connSetWriteHandler(conn, rdbPipeWriteHandler);
+                muxConnSetWriteHandler(slave, rdbPipeWriteHandler);
             }
             stillAlive++;
         }
