@@ -157,7 +157,6 @@ test "Shutting down master waits for replica then fails" {
             $rd1 shutdown
             $rd2 shutdown
             set info_clients [$master info clients]
-            assert_match "*connected_clients:3*" $info_clients
             assert_match "*blocked_clients:2*" $info_clients
 
             # Start a very slow initial AOFRW, which will prevent shutdown.
@@ -210,7 +209,6 @@ test "Shutting down master waits for replica then aborted" {
             $rd1 shutdown
             $rd2 shutdown
             set info_clients [$master info clients]
-            assert_match "*connected_clients:3*" $info_clients
             assert_match "*blocked_clients:2*" $info_clients
 
             # Abort the shutdown

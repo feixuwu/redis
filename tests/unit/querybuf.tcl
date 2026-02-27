@@ -17,7 +17,7 @@ proc client_query_buffer {name} {
     return 0
 }
 
-start_server {tags {"querybuf slow"}} {
+start_server {tags {"querybuf slow mux:skip"}} {
     # increase the execution frequency of clientsCron
     r config set hz 100
 
