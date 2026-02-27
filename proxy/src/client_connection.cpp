@@ -3,6 +3,7 @@
 #include "worker_thread.h"
 #include "backend_manager.h"
 #include "mux_backend_connection.h"
+#include "i_backend_connection.h"
 #include "resp_parser.h"
 #include "logger.h"
 #include "config.h"
@@ -45,10 +46,14 @@ const std::string& ClientConnection::getProxyPassword() const {
     return g_proxy_password ? *g_proxy_password : empty;
 }
 
-void ClientConnection::setStreaming(MuxBackendConnection* conn, uint64_t stream_id) {
+void ClientConnection::setStreaming(IBackendConnection* conn, uint64_t stream_id) {
     backend_conn_ = conn;
     stream_id_ = stream_id;
     state_ = ClientState::STREAMING;
+}
+
+void ClientConnection::setStreamingMux(MuxBackendConnection* conn, uint64_t stream_id) {
+    setStreaming(static_cast<IBackendConnection*>(conn), stream_id);
 }
 
 void ClientConnection::close() {
@@ -219,7 +224,7 @@ bool ClientConnection::ensureBackendStream() {
         // Add this client to the pending queue - will be notified when ready
         LOG_DEBUG("Client fd=%d: backend not ready yet, adding to pending queue", fd_);
         mux_conn->addPendingClient(this);
-        backend_conn_ = mux_conn;  // Track the connection we're waiting for
+        backend_conn_ = static_cast<IBackendConnection*>(mux_conn);  // Track the connection we're waiting for
         return false;
     }
 
@@ -282,11 +287,65 @@ void ClientConnection::flushSendBuffer() {
         send_buf_.clear();
         send_offset_ = 0;
         // Remove write interest if no more data
-        worker_->getEventLoop().modifyEvent(fd_, EVENT_READABLE);
+        if (fd_ >= 0) {
+            worker_->getEventLoop().modifyEvent(fd_, EVENT_READABLE);
+        }
     } else if (send_offset_ > send_buf_.size() / 2) {
         send_buf_.erase(send_buf_.begin(), send_buf_.begin() + send_offset_);
         send_offset_ = 0;
     }
+}
+
+// ========== 热升级: 缓冲区注入 ==========
+
+void ClientConnection::injectRecvBuffer(const std::vector<char>& data) {
+    if (data.empty()) return;
+    recv_buf_.insert(recv_buf_.begin(), data.begin(), data.end());
+    LOG_DEBUG("Client fd=%d: injected %zu bytes into recv_buf", fd_, data.size());
+}
+
+void ClientConnection::injectSendBuffer(const std::vector<char>& data) {
+    if (data.empty()) return;
+    // 注入到发送缓冲区开头，这些数据需要优先发送
+    send_buf_.insert(send_buf_.begin() + send_offset_, data.begin(), data.end());
+    LOG_DEBUG("Client fd=%d: injected %zu bytes into send_buf", fd_, data.size());
+    // 尝试立即刷新
+    flushSendBuffer();
+}
+
+// ========== 热升级: Drain-Fence 相关 ==========
+
+void ClientConnection::flushRecvBuffer() {
+    // 显式将 recv_buf_ 中的残余数据转发到后端
+    // 在 Drain-Fence 协议中，setPaused(true) 后不再读取新数据，
+    // 但 recv_buf_ 中可能还有已接收但未转发的数据
+    if (recv_buf_.empty()) return;
+    if (!backend_conn_ || stream_id_ == 0) return;
+
+    backend_conn_->sendData(stream_id_, recv_buf_.data(), recv_buf_.size());
+    recv_buf_.clear();
+    LOG_DEBUG("Client fd=%d: flushed recv_buf to backend (stream=%llu)",
+             fd_, (unsigned long long)stream_id_);
+}
+
+std::vector<char> ClientConnection::extractRecvBuffer() {
+    // 移走 recv_buf_（迁移给新进程）
+    std::vector<char> result;
+    result.swap(recv_buf_);
+    LOG_DEBUG("Client fd=%d: extracted recv_buf (%zu bytes)", fd_, result.size());
+    return result;
+}
+
+std::vector<char> ClientConnection::extractSendBuffer() {
+    // 移走 send_buf_ 中未发送的部分（迁移给新进程）
+    std::vector<char> result;
+    if (send_offset_ < send_buf_.size()) {
+        result.assign(send_buf_.begin() + send_offset_, send_buf_.end());
+    }
+    send_buf_.clear();
+    send_offset_ = 0;
+    LOG_DEBUG("Client fd=%d: extracted send_buf (%zu bytes)", fd_, result.size());
+    return result;
 }
 
 } // namespace proxy

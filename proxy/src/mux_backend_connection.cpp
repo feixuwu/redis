@@ -1,6 +1,7 @@
 // MuxBackendConnection implementation - to be completed in task 6
 #include "mux_backend_connection.h"
 #include "client_connection.h"
+#include "ipc_proxy_frontend.h"
 #include "worker_thread.h"
 #include "event_loop.h"
 #include "resp_parser.h"
@@ -501,6 +502,9 @@ void MuxBackendConnection::handleFrame(uint8_t type, uint64_t stream_id,
             ClientConnection* client = getStreamClient(stream_id);
             if (client) {
                 client->appendToSendBuffer(payload, len);
+            } else if (ipc_frontend_ && ipc_frontend_->isProxied(stream_id)) {
+                // 热升级: Client 还在旧进程，通过 IPC 回传
+                ipc_frontend_->forwardToOldProcess(stream_id, payload, len);
             } else {
                 LOG_WARN("DATA frame for unknown stream %llu on backend %s:%d",
                          (unsigned long long)stream_id, addr_.c_str(), port_);
@@ -573,13 +577,110 @@ void MuxBackendConnection::flushPendingStreams() {
             client->close();
             continue;
         }
-        client->setStreaming(this, sid);
+        client->setStreamingMux(this, sid);
         client->retryForwardToBackend();
     }
 }
 
 void MuxBackendConnection::addPendingClient(ClientConnection* client) {
     pending_clients_.push_back(client);
+}
+
+// ========== 热升级支持方法 ==========
+
+void MuxBackendConnection::rebindStream(uint64_t stream_id, ClientConnection* new_client) {
+    auto it = streams_.find(stream_id);
+    if (it != streams_.end()) {
+        it->second = new_client;
+        LOG_DEBUG("Rebound stream %llu to new client fd=%d on backend %s:%d",
+                  (unsigned long long)stream_id,
+                  new_client ? new_client->getFd() : -1,
+                  addr_.c_str(), port_);
+    } else {
+        // stream 不存在，直接添加
+        streams_[stream_id] = new_client;
+        active_stream_count_++;
+        LOG_DEBUG("Added stream %llu for migrated client on backend %s:%d",
+                  (unsigned long long)stream_id, addr_.c_str(), port_);
+    }
+}
+
+MuxBackendConnection::FrameParseState MuxBackendConnection::getFrameParseState() const {
+    FrameParseState state;
+    memcpy(state.frame_header_buf, frame_header_buf_, sizeof(frame_header_buf_));
+    state.header_bytes_read = header_bytes_read_;
+    state.parsing_payload = parsing_payload_;
+    state.current_flags = current_flags_;
+    state.current_stream_id = current_stream_id_;
+    state.current_payload_len = current_payload_len_;
+    state.frame_payload_buf = frame_payload_buf_;
+    state.recv_buf = recv_buf_;
+    state.send_buf = send_buf_;
+    state.send_offset = send_offset_;
+    return state;
+}
+
+void MuxBackendConnection::restoreFrameParseState(const FrameParseState& state) {
+    memcpy(frame_header_buf_, state.frame_header_buf, sizeof(frame_header_buf_));
+    header_bytes_read_ = state.header_bytes_read;
+    parsing_payload_ = state.parsing_payload;
+    current_flags_ = state.current_flags;
+    current_stream_id_ = state.current_stream_id;
+    current_payload_len_ = state.current_payload_len;
+    frame_payload_buf_ = state.frame_payload_buf;
+    recv_buf_ = state.recv_buf;
+    send_buf_ = state.send_buf;
+    send_offset_ = state.send_offset;
+}
+
+void MuxBackendConnection::restoreFrameParseState(
+    const unsigned char* header_buf, size_t header_bytes_read,
+    bool parsing_payload, uint8_t flags,
+    uint64_t stream_id, uint32_t payload_len,
+    const char* payload_buf, size_t payload_buf_len) {
+    if (header_buf && header_bytes_read > 0) {
+        size_t copy_len = std::min(header_bytes_read, sizeof(frame_header_buf_));
+        memcpy(frame_header_buf_, header_buf, copy_len);
+    }
+    header_bytes_read_ = header_bytes_read;
+    parsing_payload_ = parsing_payload;
+    current_flags_ = flags;
+    current_stream_id_ = stream_id;
+    current_payload_len_ = payload_len;
+    if (payload_buf && payload_buf_len > 0) {
+        frame_payload_buf_.assign(payload_buf, payload_buf + payload_buf_len);
+    }
+}
+
+void MuxBackendConnection::adoptFd(int fd) {
+    // 接管一个已有的 fd（从旧进程迁移过来，不重新 connect）
+    if (fd_ >= 0 && fd_ != fd) {
+        ::close(fd_);
+    }
+    fd_ = fd;
+    state_ = MuxConnState::READY;
+    LOG_INFO("Backend %s:%d adopted fd=%d", addr_.c_str(), port_, fd);
+}
+
+int MuxBackendConnection::detachFd() {
+    // 分离 fd 所有权（不 close），防止析构时 close
+    int f = fd_;
+    fd_ = -1;
+    return f;
+}
+
+void MuxBackendConnection::injectRecvBuffer(const std::vector<char>& data) {
+    if (data.empty()) return;
+    recv_buf_.insert(recv_buf_.end(), data.begin(), data.end());
+    LOG_DEBUG("Backend %s:%d: injected %zu bytes into recv_buf",
+             addr_.c_str(), port_, data.size());
+}
+
+void MuxBackendConnection::injectSendBuffer(const std::vector<char>& data) {
+    if (data.empty()) return;
+    send_buf_.insert(send_buf_.end(), data.begin(), data.end());
+    LOG_DEBUG("Backend %s:%d: injected %zu bytes into send_buf",
+             addr_.c_str(), port_, data.size());
 }
 
 } // namespace proxy

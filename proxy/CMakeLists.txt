@@ -35,6 +35,8 @@ set(PROXY_SOURCES
     src/mux_backend_connection.cpp
     src/admin_server.cpp
     src/hot_upgrade.cpp
+    src/ipc_proxy_backend.cpp
+    src/ipc_proxy_frontend.cpp
     src/resp_parser.cpp
 )
 

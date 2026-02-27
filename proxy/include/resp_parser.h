@@ -34,6 +34,20 @@ public:
     static std::string encodeInteger(int64_t val);
     static std::string encodeNullBulkString();
     static std::string encodeArray(const std::vector<std::string>& encoded_items);
+
+    // ========== 热升级: RESP 命令/响应计数（用于 in-flight 精确跟踪） ==========
+
+    // 统计 buffer 中完整的 RESP 命令数量（请求侧）
+    // 支持 multi-bulk (*N\r\n$L\r\n...) 和 inline 格式
+    static uint32_t countCommands(const char* data, size_t len);
+
+    // 统计 buffer 中完整的 RESP 响应数量（回复侧）
+    // 支持 Simple String (+), Error (-), Integer (:), Bulk String ($), Array (*) 格式
+    static uint32_t countResponses(const char* data, size_t len);
+
+private:
+    // 跳过一个完整的 RESP 元素（递归处理 Array），返回消耗的字节数，0 表示不完整
+    static size_t skipOneResponse(const char* data, size_t len);
 };
 
 } // namespace proxy

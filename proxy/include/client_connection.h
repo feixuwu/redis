@@ -9,6 +9,7 @@ namespace proxy {
 
 class WorkerThread;
 class MuxBackendConnection;
+class IBackendConnection;
 
 // Client connection states
 enum class ClientState {
@@ -32,12 +33,14 @@ public:
     ClientState getState() const { return state_; }
     bool isAuthenticated() const { return state_ >= ClientState::AUTHENTICATED; }
     uint64_t getStreamId() const { return stream_id_; }
-    MuxBackendConnection* getBackendConn() const { return backend_conn_; }
+    IBackendConnection* getBackendConn() const { return backend_conn_; }
     WorkerThread* getWorker() const { return worker_; }
 
     // State management
     void setAuthenticated() { state_ = ClientState::AUTHENTICATED; }
-    void setStreaming(MuxBackendConnection* conn, uint64_t stream_id);
+    void setStreaming(IBackendConnection* conn, uint64_t stream_id);
+    // 保留旧接口兼容性（隐式转换）
+    void setStreamingMux(MuxBackendConnection* conn, uint64_t stream_id);
     void close();
 
     // I/O operations
@@ -58,14 +61,29 @@ public:
     void setPaused(bool paused) { paused_ = paused; }
     bool isPaused() const { return paused_; }
 
+    // Hot upgrade: 获取和注入缓冲区（用于迁移时传递 buffer 数据）
+    const std::vector<char>& getRecvBuf() const { return recv_buf_; }
+    const std::vector<char>& getSendBuf() const { return send_buf_; }
+    size_t getSendOffset() const { return send_offset_; }
+    void clearRecvBuf() { recv_buf_.clear(); }
+    void injectRecvBuffer(const std::vector<char>& data);
+    void injectSendBuffer(const std::vector<char>& data);
+
+    // 热升级: 显式 flush recv_buf 中的残余数据到后端（用于 Drain-Fence 协议）
+    void flushRecvBuffer();
+
+    // 热升级: 提取并移走 recv_buf / send_buf（用于迁移时传递给新进程）
+    std::vector<char> extractRecvBuffer();
+    std::vector<char> extractSendBuffer();
+
 private:
     int fd_;
     uint16_t listen_port_;
     ClientState state_ = ClientState::CONNECTED;
     WorkerThread* worker_;
 
-    // Backend binding
-    MuxBackendConnection* backend_conn_ = nullptr;
+    // Backend binding (通过 IBackendConnection 抽象基类，支持 MUX 和 IPC 代理)
+    IBackendConnection* backend_conn_ = nullptr;
     uint64_t stream_id_ = 0;
 
     // Read/write buffers
